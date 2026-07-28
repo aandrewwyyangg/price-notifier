@@ -19,9 +19,23 @@ VALUES
     (413150, 1499, '2026-07-27 12:00:00+00');
 
 -- Alice and Bob watch Portal 2 in common, which exercises the game->users
--- fan-out. Bob's Hades watch is the deliberate NULL-ratchet case: never
--- alerted, no baseline, and Hades has no prices row at all. Any alert query
--- that silently drops this row has the three-valued-logic bug.
+-- fan-out. Stardew Valley has a price but no watcher until Carol, and Hades
+-- has a watcher but no price at all.
+--
+-- alert_below and last_alerted_cents are INDEPENDENTLY nullable, so the alert
+-- predicate has four cases. One row covers each; a query that silently drops
+-- any of them has the three-valued-logic bug.
+--
+--   alert_below | last_alerted | row              | why it matters
+--   ------------+--------------+------------------+---------------------------
+--   set         | set          | Alice / Portal 2 | both bounds apply
+--   NULL        | set          | Bob   / Portal 2 | ratchet only, no threshold
+--   set         | NULL         | Bob   / Hades    | never alerted, no price
+--   NULL        | NULL         | Carol / Stardew  | bare /watch, price exists
+--
+-- Portal 2's latest price is 999, so the Portal 2 rows are falsifiable: a
+-- candidate of 899 must reach Bob, and 499 must reach both. A candidate of
+-- 999 must reach NEITHER — the ratchet comparison is strict.
 INSERT INTO watches (
     discord_user_id,
     appid,
@@ -31,6 +45,7 @@ INSERT INTO watches (
 VALUES
     (100000000000000001, 620, 500, 999),
     (100000000000000002, 620, NULL, 999),
-    (100000000000000002, 1145360, 1500, NULL);
+    (100000000000000002, 1145360, 1500, NULL),
+    (100000000000000003, 413150, NULL, NULL);
 
 COMMIT;
