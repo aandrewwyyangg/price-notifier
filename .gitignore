@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 .env
 .venv/
+venv/
+
+# Throwaway connection test — contains a hardcoded local password.
+scratch_connect.py
+
