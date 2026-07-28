@@ -26,7 +26,13 @@ CREATE TABLE watches (
     discord_user_id BIGINT NOT NULL,
     appid INTEGER NOT NULL,
     alert_below INTEGER,
-    last_alerted_cents INTEGER NOT NULL,
+
+    -- NULL = no reference point yet; this watch has never alerted. Seeded
+    -- silently by the poller's first observation, never at watch creation.
+    -- Any predicate on this column needs an explicit NULL branch: comparing
+    -- to NULL yields NULL, and WHERE drops the row without erroring.
+    -- The CHECK below is satisfied by NULL and will not catch a missing one.
+    last_alerted_cents INTEGER,
 
     PRIMARY KEY (discord_user_id, appid),
 
