@@ -1,6 +1,14 @@
 CREATE TABLE games (
     appid INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
+
+    -- NULL until the poller completes its first successful Steam fetch.
+    -- appid is the game's IDENTITY; name is derived Steam metadata that may
+    -- be temporarily unknown. Keeping this NOT NULL would force /watch to
+    -- fetch from Steam synchronously — the exact availability problem the
+    -- nullable ratchet was chosen to avoid. Output must fall back to the
+    -- appid whenever this is NULL; never invent a placeholder name.
+    name TEXT,
+
     last_checked_at TIMESTAMPTZ,
 
     CHECK (appid > 0)
