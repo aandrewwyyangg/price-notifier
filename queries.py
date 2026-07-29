@@ -15,3 +15,15 @@ WHERE %(new_price)s IS DISTINCT FROM (
 )
 RETURNING appid, cents, checked_at;
 """
+FIND_WATCHERS_TO_NOTIFY = """
+SELECT discord_user_id
+FROM watches
+WHERE appid = %(appid)s
+  AND last_alerted_cents IS NOT NULL
+  AND %(new_price)s < last_alerted_cents
+  AND (
+      alert_below IS NULL
+      OR %(new_price)s < alert_below
+  )
+ORDER BY discord_user_id;
+"""
