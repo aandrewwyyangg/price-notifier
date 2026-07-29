@@ -15,9 +15,17 @@ WHERE %(new_price)s IS DISTINCT FROM (
 )
 RETURNING appid, cents, checked_at;
 """
-FIND_WATCHERS_TO_NOTIFY = """
-SELECT discord_user_id
-FROM watches
+SEED_WATCH_RATCHETS = """
+UPDATE watches
+SET last_alerted_cents = %(new_price)s
+WHERE appid = %(appid)s
+  AND last_alerted_cents IS NULL;
+"""
+
+
+RATCHET_WATCHERS_TO_NOTIFY = """
+UPDATE watches
+SET last_alerted_cents = %(new_price)s
 WHERE appid = %(appid)s
   AND last_alerted_cents IS NOT NULL
   AND %(new_price)s < last_alerted_cents
@@ -25,5 +33,5 @@ WHERE appid = %(appid)s
       alert_below IS NULL
       OR %(new_price)s < alert_below
   )
-ORDER BY discord_user_id;
+RETURNING discord_user_id;
 """
