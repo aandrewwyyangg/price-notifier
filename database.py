@@ -9,11 +9,12 @@ from output import (
     UserAlert,
     build_price_drop_alert,
     format_price,
-    game_label,
+    log_game_label,
     log_operation,
 )
 from queries import (
     ENSURE_GAME_EXISTS,
+    GET_WATCHED_APPIDS,
     INSERT_PRICE_IF_CHANGED,
     INSERT_WATCH,
     RATCHET_WATCHERS_TO_NOTIFY,
@@ -48,6 +49,13 @@ def _connect():
     )
 
 
+def get_watched_appids() -> list[int]:
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(GET_WATCHED_APPIDS)
+            return [row[0] for row in cur.fetchall()]
+
+
 def create_watch(
     discord_user_id: int,
     appid: int,
@@ -69,8 +77,7 @@ def create_watch(
                 cur.execute(INSERT_WATCH, parameters)
                 cur.fetchone()
     except psycopg.errors.UniqueViolation:
-        # The exception is caught outside the connection context so both
-        # statements have already been rolled back before the caller responds.
+        # The connection context has already rolled back both statements.
         return False
 
     return True
@@ -92,8 +99,8 @@ def _run_poll_transaction(
     cur.execute(INSERT_PRICE_IF_CHANGED, parameters)
     price_row = cur.fetchone()
 
-    # Seeding must precede ratcheting. A newly seeded watch receives the
-    # current price as its reference point and cannot alert in this cycle.
+    # Seeding must happen first so a newly seeded watch cannot alert during
+    # the same observation.
     cur.execute(SEED_WATCH_RATCHETS, parameters)
     seeded_watch_count = cur.rowcount
 
@@ -121,7 +128,7 @@ def process_price_observation(
         if isinstance(name, str) and name.strip()
         else None
     )
-    label = game_label(appid, normalized_name)
+    label = log_game_label(appid, normalized_name)
 
     # A response without a usable integer price is a read failure. It must not
     # advance last_checked_at or change price and ratchet state.
@@ -149,9 +156,8 @@ def process_price_observation(
         with conn.cursor() as cur:
             result = _run_poll_transaction(cur, parameters)
 
-    # Reaching this point means the connection context committed the price,
-    # successful-check timestamp, seeding, and alert ratchets.
-    label = game_label(appid, result.stored_name)
+    # The connection context committed before execution reached this point.
+    label = log_game_label(appid, result.stored_name)
 
     if result.price_recorded:
         log_operation(
@@ -176,8 +182,6 @@ def process_price_observation(
             f"for {label}"
         )
 
-    # Alerts become visible to the caller only after the transaction commits.
-    # The future Discord layer sends these; operational logs never become DMs.
     return [
         build_price_drop_alert(
             discord_user_id=discord_user_id,

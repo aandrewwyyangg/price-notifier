@@ -1,3 +1,4 @@
+import sys
 from dataclasses import dataclass
 
 
@@ -7,9 +8,22 @@ class UserAlert:
     message: str
 
 
-def game_label(appid: int | str, name: str | None) -> str:
+def user_game_label(
+    appid: int | str,
+    name: str | None,
+) -> str:
     if isinstance(name, str) and name.strip():
         return name
+
+    return f"appid {appid}"
+
+
+def log_game_label(
+    appid: int | str,
+    name: str | None,
+) -> str:
+    if isinstance(name, str) and name.strip():
+        return f"{name} ({appid})"
 
     return f"appid {appid}"
 
@@ -28,7 +42,7 @@ def build_price_drop_alert(
     name: str | None,
     new_price: int,
 ) -> UserAlert:
-    label = game_label(appid, name)
+    label = user_game_label(appid, name)
 
     return UserAlert(
         discord_user_id=discord_user_id,
@@ -36,5 +50,10 @@ def build_price_drop_alert(
     )
 
 
+def emit_user_alert(alert: UserAlert) -> None:
+    # Temporary delivery sink until this becomes a Discord DM.
+    print(f"{alert.discord_user_id}: {alert.message}")
+
+
 def log_operation(message: str) -> None:
-    print(message)
+    print(message, file=sys.stderr)

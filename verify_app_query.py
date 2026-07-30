@@ -5,15 +5,18 @@ from pathlib import Path
 import psycopg
 from dotenv import load_dotenv
 
+from database import _run_poll_transaction
+from output import (
+    build_price_drop_alert,
+    log_game_label,
+    user_game_label,
+)
 from queries import (
     ENSURE_GAME_EXISTS,
     GET_WATCHED_APPIDS,
     INSERT_WATCH,
     RECORD_SUCCESSFUL_FETCH,
 )
-
-from database import _run_poll_transaction
-from output import build_price_drop_alert
 
 
 load_dotenv()
@@ -206,7 +209,7 @@ try:
             "Failed INSERT_WATCH left a watch row behind"
         )
         print("Failed watch transaction: both tables unchanged")
-                # Exercise the complete poll transaction against the fixture's
+        # Exercise the complete poll transaction against the fixture's
         # intentionally unnamed game. The surrounding verifier transaction
         # rolls every change back in finally.
         poll_observed_at = datetime(
@@ -258,9 +261,15 @@ try:
             "NULL-name alert did not fall back to the appid: "
             f"{fallback_alert.message}"
         )
+
+        assert user_game_label(620, "Portal 2") == "Portal 2"
+        assert log_game_label(620, "Portal 2") == "Portal 2 (620)"
+        assert user_game_label(292030, None) == "appid 292030"
+        assert log_game_label(292030, None) == "appid 292030"
+        
         print(f"Poll transaction fallback: {fallback_alert}")
 
-        
+
         # RECORD_SUCCESSFUL_FETCH fills a NULL name.
         record_appid = 292030
         first_observed_at = datetime(
