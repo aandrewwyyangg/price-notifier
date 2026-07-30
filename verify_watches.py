@@ -94,6 +94,13 @@ cases = [
         0,
         [100000000000000002],
     ),
+    (
+        "Unnamed game at 3499 - drop",
+        292030,
+        3499,
+        0,
+        [100000000000000001],
+    ),
 ]
 
 conn = psycopg.connect(**connection_args)

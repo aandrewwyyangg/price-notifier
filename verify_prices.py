@@ -1,9 +1,7 @@
 import os
 from datetime import datetime, timezone
-
 import psycopg
 from dotenv import load_dotenv
-
 from queries import INSERT_PRICE_IF_CHANGED
 
 

@@ -1,7 +1,10 @@
-import time
 import json
 import os
+import time
+
 import requests
+
+from output import format_price, game_label, log_operation
 
 
 APPIDS = ["413150", "1091500"]
@@ -36,10 +39,15 @@ def get_game(appid, cc="us"):
     if not isinstance(data, dict):
         return None
 
+    name = data.get("name")
+
+    if not isinstance(name, str) or not name.strip():
+        name = None
+
     price_overview = data.get("price_overview") or {}
 
     return {
-        "name": data.get("name", f"App {appid}"),
+        "name": name,
         "price": price_overview.get("final"),
     }
 
@@ -57,13 +65,6 @@ def save_prices(prices):
         json.dump(prices, f, indent=2)
 
 
-def format_price(cents):
-    if cents is None:
-        return "unavailable"
-
-    return f"${cents / 100:.2f}"
-
-
 def check_all(appids, prices):
     for index, appid in enumerate(appids):
         if index > 0:
@@ -72,17 +73,19 @@ def check_all(appids, prices):
         try:
             game = get_game(appid)
         except requests.RequestException as e:
-            print(f"Request failed for app {appid}: {e}")
+            log_operation(f"Request failed for appid {appid}: {e}")
             continue
 
         if game is None:
-            print(f"Could not find data for app {appid}")
+            log_operation(f"Could not find data for appid {appid}")
             continue
+
+        label = game_label(appid, game["name"])
 
         # Missing data is not a price change, so retain the last known price.
         if game["price"] is None:
-            print(
-                f"No price reading for {game['name']} ({appid}); "
+            log_operation(
+                f"No price reading for {label}; "
                 "keeping the last known price"
             )
             continue
@@ -90,8 +93,8 @@ def check_all(appids, prices):
         # The first observation establishes a baseline; it is not a change.
         if appid not in prices:
             prices[appid] = game
-            print(
-                f"Baseline recorded for {game['name']}: "
+            log_operation(
+                f"Baseline recorded for {label}: "
                 f"{format_price(game['price'])}"
             )
             continue
@@ -100,9 +103,10 @@ def check_all(appids, prices):
         new_price = game["price"]
 
         if new_price != old_price:
-            print(
-                f"{game['name']} price changed: "
-                f"{format_price(old_price)} -> {format_price(new_price)}"
+            log_operation(
+                f"{label} price changed: "
+                f"{format_price(old_price)} -> "
+                f"{format_price(new_price)}"
             )
 
         prices[appid] = game
