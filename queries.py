@@ -88,9 +88,13 @@ RETURNING
 # never-seen name stays NULL. COALESCE(name, %(name)s) would instead freeze
 # the first name ever seen.
 #
-# OPEN QUESTION: this currently runs on any response, so a reply carrying no
-# price still advances last_checked_at — which can mask the very staleness the
-# column exists to reveal. See the design notes "What counts as a successful fetch".
+# CALLER INVARIANT: run this ONLY once Steam has returned a USABLE PRICE.
+# "Successful fetch" was decided as option B — a usable price, not merely an
+# HTTP response — and the guard that enforces it lives one level up, in
+# database.py::process_price_observation, which returns before reaching this
+# query. The query itself cannot check: it never sees the price.
+# Advancing last_checked_at on a price-less reply would make a dead fetcher
+# look healthy, masking the exact staleness the column exists to reveal.
 RECORD_SUCCESSFUL_FETCH = """
 UPDATE games
 SET
