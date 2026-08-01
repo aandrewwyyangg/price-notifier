@@ -1,6 +1,6 @@
 import time
 from datetime import datetime, timezone
-
+import psycopg
 import requests
 
 from database import (
@@ -13,9 +13,7 @@ from output import (
     log_operation,
 )
 
-
 INTERVAL = 60
-
 
 def get_game(appid, cc="us"):
     r = requests.get(
@@ -26,8 +24,8 @@ def get_game(appid, cc="us"):
         },
         timeout=10,
     )
-    r.raise_for_status()
 
+    r.raise_for_status()
     payload = r.json()
 
     # Steam may return JSON null, which becomes Python None.
@@ -56,7 +54,6 @@ def get_game(appid, cc="us"):
         "price": price_overview.get("final"),
     }
 
-
 def check_all(appids):
     for index, appid in enumerate(appids):
         if index > 0:
@@ -77,19 +74,36 @@ def check_all(appids):
             )
             continue
 
-        alerts = process_price_observation(
-            appid=appid,
-            name=game["name"],
-            new_price=game["price"],
-            observed_at=datetime.now(timezone.utc),
-        )
+        try:
+            alerts = process_price_observation(
+                appid=appid,
+                name=game["name"],
+                new_price=game["price"],
+                observed_at=datetime.now(timezone.utc),
+            )
+        except psycopg.OperationalError as e:
+            log_operation(
+                f"Database operation failed for "
+                f"{log_game_label(appid, game['name'])}: {e}"
+            )
+            continue
 
         # process_price_observation returns only after its transaction commits.
         for alert in alerts:
             emit_user_alert(alert)
 
+def run_poll_cycle():
+    try:
+        appids = get_watched_appids()
+    except psycopg.OperationalError as e:
+        log_operation(
+            f"Could not load watched appids from PostgreSQL: {e}"
+        )
+        return
+
+    check_all(appids)
 
 if __name__ == "__main__":
     while True:
-        check_all(get_watched_appids())
+        run_poll_cycle()
         time.sleep(INTERVAL)
