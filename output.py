@@ -5,6 +5,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True, slots=True)
 class UserAlert:
     discord_user_id: int
+    appid: int
     message: str
 
 
@@ -46,6 +47,7 @@ def build_price_drop_alert(
 
     return UserAlert(
         discord_user_id=discord_user_id,
+        appid=appid,
         message=f"{label} dropped to {format_price(new_price)}.",
     )
 
