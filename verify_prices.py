@@ -1,22 +1,13 @@
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 import psycopg
-from dotenv import load_dotenv
 
+from database import connection_args
 from queries import INSERT_PRICE_IF_CHANGED
 
 
-load_dotenv()
-
-connection_args = {
-    "host": "127.0.0.1",
-    "port": 5432,
-    "dbname": "steam_notifier",
-    "user": "postgres",
-    "password": os.getenv("POSTGRES_PASSWORD"),
-}
+# Importing database also runs its load_dotenv(), so .env is already applied.
 
 fixture_path = Path(__file__).with_name("fixtures.sql")
 fixture_sql = "\n".join(
@@ -40,7 +31,7 @@ cases = [
     ),
 ]
 
-conn = psycopg.connect(**connection_args)
+conn = psycopg.connect(**connection_args())
 
 try:
     with conn.cursor() as cur:

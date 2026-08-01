@@ -34,19 +34,46 @@ class _PollTransactionResult:
     discord_user_ids: tuple[int, ...]
 
 
-def _connect():
+def connection_args() -> dict:
+    """Resolve connection parameters from the environment.
+
+    Every value comes from .env so pointing at a managed database at deploy
+    time is configuration, not a code change. The defaults are the local
+    compose setup, which is why nothing has to be set to run the verifiers.
+
+    Public because the verifiers need a BARE connection: `with connect(...)`
+    commits on clean exit, which would defeat a test that rolls back.
+    """
     password = os.getenv("POSTGRES_PASSWORD")
 
     if password is None:
         raise RuntimeError("POSTGRES_PASSWORD is not set")
 
-    return psycopg.connect(
-        host="127.0.0.1",
-        port=5432,
-        dbname=os.getenv("POSTGRES_DB", "steam_notifier"),
-        user=os.getenv("POSTGRES_USER", "postgres"),
-        password=password,
-    )
+    return {
+        # 127.0.0.1, never "localhost". On Windows localhost resolves to ::1
+        # first while compose binds IPv4 only, so every connect waits out an
+        # IPv6 timeout — it looks like a hang, not an error.
+        "host": os.getenv("POSTGRES_HOST", "127.0.0.1"),
+        "port": int(os.getenv("POSTGRES_PORT", "5432")),
+        "dbname": os.getenv("POSTGRES_DB", "steam_notifier"),
+        "user": os.getenv("POSTGRES_USER", "postgres"),
+        "password": password,
+        # Without this a connect can hang indefinitely rather than fail — an
+        # unreachable host just sits there, and the symptom reads as "nothing
+        # is happening" instead of "the database is down". A bounded wait turns
+        # it into an OperationalError, which the poller already treats as
+        # transient and retries next cycle.
+        #
+        # 10s is generous for a managed database over the network, and it is
+        # deliberately LONGER than Discord's ~3s interaction deadline: a slash
+        # command must defer() before doing database work, so the timeout is
+        # not what keeps the command inside its budget.
+        "connect_timeout": int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "10")),
+    }
+
+
+def _connect():
+    return psycopg.connect(**connection_args())
 
 
 def get_watched_appids() -> list[int]:

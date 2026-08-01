@@ -1,16 +1,16 @@
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 import psycopg
-from dotenv import load_dotenv
 
-from database import _run_poll_transaction
+from database import _run_poll_transaction, connection_args
+
 from output import (
     build_price_drop_alert,
     log_game_label,
     user_game_label,
 )
+
 from queries import (
     ENSURE_GAME_EXISTS,
     GET_WATCHED_APPIDS,
@@ -19,15 +19,7 @@ from queries import (
 )
 
 
-load_dotenv()
-
-connection_args = {
-    "host": "127.0.0.1",
-    "port": 5432,
-    "dbname": "steam_notifier",
-    "user": "postgres",
-    "password": os.getenv("POSTGRES_PASSWORD"),
-}
+# Importing database also runs its load_dotenv(), so .env is already applied.
 
 fixture_path = Path(__file__).with_name("fixtures.sql")
 fixture_sql = "\n".join(
@@ -36,7 +28,7 @@ fixture_sql = "\n".join(
     if line.strip().upper() not in {"BEGIN;", "COMMIT;"}
 )
 
-conn = psycopg.connect(**connection_args)
+conn = psycopg.connect(**connection_args())
 
 try:
     with conn.cursor() as cur:
@@ -253,6 +245,11 @@ try:
             appid=poll_parameters["appid"],
             name=poll_result.stored_name,
             new_price=poll_parameters["new_price"],
+        )    
+
+        assert fallback_alert.appid == poll_parameters["appid"], (
+            "UserAlert did not retain the appid needed for delivery logs: "
+            f"{fallback_alert.appid}"
         )
 
         assert fallback_alert.message == (
@@ -266,7 +263,7 @@ try:
         assert log_game_label(620, "Portal 2") == "Portal 2 (620)"
         assert user_game_label(292030, None) == "appid 292030"
         assert log_game_label(292030, None) == "appid 292030"
-        
+
         print(f"Poll transaction fallback: {fallback_alert}")
 
 
@@ -369,4 +366,4 @@ finally:
     conn.rollback()
     conn.close()
 
-print("All application-query cases passed.")
+print("All app query cases passed.")
