@@ -245,7 +245,7 @@ try:
             appid=poll_parameters["appid"],
             name=poll_result.stored_name,
             new_price=poll_parameters["new_price"],
-        )    
+        ) 
 
         assert fallback_alert.appid == poll_parameters["appid"], (
             "UserAlert did not retain the appid needed for delivery logs: "
