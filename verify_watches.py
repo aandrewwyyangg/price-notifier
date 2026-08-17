@@ -47,6 +47,20 @@ cases = [
         0,
         [],
     ),
+    # DECIDED (defect D4): alert_below is STRICT — the column is named
+    # alert_BELOW, so a price equal to the threshold does not fire. 500 equals
+    # Alice's threshold exactly: her ratchet (999) would allow it, the
+    # threshold must veto it. Bob has no threshold and a ratchet of 899, so he
+    # is the proof the price itself is alertable. Before this case existed,
+    # mutating `< alert_below` to `<=` broke nothing — no fixture case ever
+    # landed ON the boundary.
+    (
+        "Portal 2 at 500 - equal to Alice's threshold",
+        620,
+        500,
+        0,
+        [100000000000000002],
+    ),
     (
         "Portal 2 at 499 - deeper drop",
         620,
@@ -94,7 +108,17 @@ cases = [
     ),
 ]
 
-conn = psycopg.connect(**connection_args())
+# This script reloads fixtures.sql, which TRUNCATEs every table it touches.
+# Rollback makes that safe locally, but pointing .env at a managed database
+# and running this would still take an ACCESS EXCLUSIVE lock on live tables —
+# so anything non-local is refused outright.
+connection_parameters = connection_args()
+assert connection_parameters["host"] in {"127.0.0.1", "localhost", "::1"}, (
+    f"Refusing to run fixtures against non-local host "
+    f"{connection_parameters['host']!r}"
+)
+
+conn = psycopg.connect(**connection_parameters)
 
 try:
     with conn.cursor() as cur:

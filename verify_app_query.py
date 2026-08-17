@@ -7,12 +7,15 @@ from database import _run_poll_transaction, connection_args
 
 from output import (
     build_price_drop_alert,
+    build_watch_line,
     log_game_label,
     user_game_label,
 )
 
 from queries import (
+    DELETE_WATCH,
     ENSURE_GAME_EXISTS,
+    GET_USER_WATCHES,
     GET_WATCHED_APPIDS,
     INSERT_WATCH,
     RECORD_SUCCESSFUL_FETCH,
@@ -28,7 +31,17 @@ fixture_sql = "\n".join(
     if line.strip().upper() not in {"BEGIN;", "COMMIT;"}
 )
 
-conn = psycopg.connect(**connection_args())
+# This script reloads fixtures.sql, which TRUNCATEs every table it touches.
+# Rollback makes that safe locally, but pointing .env at a managed database
+# and running this would still take an ACCESS EXCLUSIVE lock on live tables —
+# so anything non-local is refused outright.
+connection_parameters = connection_args()
+assert connection_parameters["host"] in {"127.0.0.1", "localhost", "::1"}, (
+    f"Refusing to run fixtures against non-local host "
+    f"{connection_parameters['host']!r}"
+)
+
+conn = psycopg.connect(**connection_parameters)
 
 try:
     with conn.cursor() as cur:
@@ -44,6 +57,88 @@ try:
             f"got {actual_appids}"
         )
         print(f"GET_WATCHED_APPIDS: {actual_appids}")
+
+        # GET_USER_WATCHES joins watches to games and pulls the latest price
+        # per appid. Between them, Bob and Alice cover both nullables: Hades
+        # has a watch and NO price history (latest cents NULL), and 292030 has
+        # a NULL name. These run BEFORE the poll-transaction case below, which
+        # would otherwise move 292030's latest price.
+        cur.execute(
+            GET_USER_WATCHES,
+            {"discord_user_id": 100000000000000002},
+        )
+        bob_watches = cur.fetchall()
+
+        assert bob_watches == [
+            (620, "Portal 2", None, 999),
+            (1145360, "Hades", 1500, None),
+        ], f"GET_USER_WATCHES (Bob): {bob_watches}"
+
+        cur.execute(
+            GET_USER_WATCHES,
+            {"discord_user_id": 100000000000000001},
+        )
+        alice_watches = cur.fetchall()
+
+        assert alice_watches == [
+            (620, "Portal 2", 500, 999),
+            (292030, None, None, 3999),
+        ], f"GET_USER_WATCHES (Alice): {alice_watches}"
+
+        # Rendering the same rows: a missing price is "unavailable", a NULL
+        # name falls back to the appid, and a NULL threshold adds no clause.
+        assert build_watch_line(*bob_watches[1]) == (
+            "Hades — latest price unavailable, alerting below $15.00"
+        ), f"build_watch_line: {build_watch_line(*bob_watches[1])}"
+        assert build_watch_line(*alice_watches[1]) == (
+            "appid 292030 — latest price $39.99"
+        ), f"build_watch_line: {build_watch_line(*alice_watches[1])}"
+
+        # An unknown user gets an empty list — a normal answer, not an error.
+        cur.execute(GET_USER_WATCHES, {"discord_user_id": 1})
+        unknown_user_watches = cur.fetchall()
+
+        assert unknown_user_watches == [], (
+            f"GET_USER_WATCHES (unknown user): {unknown_user_watches}"
+        )
+        print("GET_USER_WATCHES: both nullables and the empty result covered")
+
+        # DELETE_WATCH's RETURNING distinguishes "removed" from "you weren't
+        # watching that" — different replies, so the difference must surface.
+        delete_parameters = {
+            "discord_user_id": 100000000000000003,
+            "appid": 413150,
+        }
+
+        cur.execute(DELETE_WATCH, delete_parameters)
+        removed_row = cur.fetchone()
+
+        assert removed_row == (413150,), (
+            f"DELETE_WATCH did not report the removed watch: {removed_row}"
+        )
+
+        cur.execute(DELETE_WATCH, delete_parameters)
+        second_removed_row = cur.fetchone()
+
+        assert second_removed_row is None, (
+            f"Deleting an absent watch returned a row: {second_removed_row}"
+        )
+
+        # Carol was 413150's only watcher, so the poll list shrinks by itself
+        # — GET_WATCHED_APPIDS reads from watches — while the games row and
+        # its price history deliberately stay put.
+        cur.execute(GET_WATCHED_APPIDS)
+        appids_after_delete = [row[0] for row in cur.fetchall()]
+
+        assert appids_after_delete == [620, 292030, 1145360], (
+            f"Poll list after DELETE_WATCH: {appids_after_delete}"
+        )
+
+        cur.execute("SELECT 1 FROM games WHERE appid = 413150;")
+        assert cur.fetchone() is not None, (
+            "DELETE_WATCH must not remove the games row"
+        )
+        print("DELETE_WATCH: removed vs absent distinguished, game row kept")
 
         # ENSURE_GAME_EXISTS inserts an unknown appid once, then becomes a no-op.
         ensured_appid = 999_999_999

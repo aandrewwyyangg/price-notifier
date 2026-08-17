@@ -6,9 +6,11 @@ It started as a script with a `prices.json` file. Most of what is interesting
 about it is *why* that file had to go, and what the replacement had to get right
 to avoid spamming people or silently losing their data.
 
-**Status:** the storage layer and the poller are complete and tested against a
-real PostgreSQL and the live Steam API. The Discord command layer and the
-deployment are in progress. See [Current status](#current-status).
+**Status:** the storage layer, the poller, and the Discord command layer are
+complete and tested against a real PostgreSQL and the live Steam API. What
+remains is going live: a bot token, a Supabase database, and a Replit Reserved
+VM, all configuration rather than code — the exact steps are in
+[DEPLOY.md](DEPLOY.md). See [Current status](#current-status).
 
 ---
 
@@ -38,22 +40,24 @@ deployment are in progress. See [Current status](#current-status).
                        │ before any DM is sent
                        ▼
   ┌───────────────────────────────────────────────┐
-  │ output.py — two channels, kept separate       │
-  │   UserAlert  → returned  → Discord DM (stdout)│
+  │ two channels, kept separate                   │
+  │   UserAlert  → returned → bot.py sends the DM │
   │   log_operation → printed → stderr            │
   └───────────────────────────────────────────────┘
 ```
 
 | File | Role |
 | --- | --- |
-| `steampricingproject.py` | Polls Steam. Owns the retry/skip behaviour. |
+| `bot.py` | The Discord client: slash commands, the poll loop, DM delivery. |
+| `steampricingproject.py` | Polls Steam. Owns the retry/skip behaviour and the currency guard. |
 | `database.py` | Every connection and transaction. The only module that talks to PostgreSQL. |
-| `queries.py` | The seven SQL statements, as named constants. |
+| `queries.py` | The nine SQL statements, as named constants. |
 | `output.py` | Formats user-facing alerts and operational logs, and keeps them apart. |
 | `schema.sql` | The DDL, written by hand. |
 | `fixtures.sql` | Repeatable seed data chosen to cover every nullable combination. |
-| `docker-compose.yml` | The local PostgreSQL, reproducible from the repo. |
+| `docker-compose.yml` | The local PostgreSQL, reproducible from the repo — first boot applies the schema. |
 | `verify_*.py` | Four test scripts (see [Tests](#tests)). |
+| `DEPLOY.md` / `.replit` | The deployment path: Replit Reserved VM + Supabase. |
 
 ---
 
@@ -266,10 +270,16 @@ docker compose ps             # wait for "healthy" — "Up" is not enough
 python -m venv venv
 .\venv\Scripts\python.exe -m pip install -r requirements.txt
 
+.\venv\Scripts\python.exe steampricingproject.py   # poller alone, no Discord
+.\venv\Scripts\python.exe bot.py                   # the real thing (needs DISCORD_BOT_TOKEN)
+```
+
+A fresh volume applies `schema.sql` and `fixtures.sql` automatically on first
+boot. To re-apply them to an existing database:
+
+```powershell
 Get-Content schema.sql   -Raw | docker compose exec -T db psql -U postgres -d steam_notifier
 Get-Content fixtures.sql -Raw | docker compose exec -T db psql -U postgres -d steam_notifier
-
-.\venv\Scripts\python.exe steampricingproject.py
 ```
 
 PowerShell has no `<` redirect, hence the `Get-Content | ` form. Keep `-T` on
@@ -345,14 +355,19 @@ Steam; one user's ratchet moved and she got the only DM; three other ratchets
 seeded silently; every `last_checked_at` advanced. Exactly one line went to
 stdout and seven to stderr, with no crossover.
 
-**In progress.**
+**Also done.** The Discord layer is implemented and its startup paths are
+proven — a missing token raises, a wrong database password fails the preflight
+with one clean line and exit 1. All nine queries are covered by the verifiers,
+including `/list`'s join with both of its NULLs (a game with no name yet, a
+game with no price yet) and `/unwatch`'s removed-versus-absent distinction.
+Prices are guarded by currency: Steam geo-gates on the requesting IP, so a
+deployed host quoted anything but the expected currency treats the response as
+a read failure rather than storing a wrong denomination.
 
-- **Discord command layer.** The architecture is decided and the seams are cut —
-  `create_watch()` returning `False` *is* the "you're already watching this game"
-  reply, and the poller returns alerts rather than sending them. What remains is
-  writing the client, the `/unwatch` and `/list` queries, and the startup
-  preflight.
-- **Deployment.** Configuration, not a rewrite, thanks to `connection_args()`.
-  Request-driven platforms like Cloud Run are a poor fit for a persistent
-  gateway connection, so this wants a small always-on instance plus a managed
-  PostgreSQL.
+**Not live yet.** The bot has not connected to Discord (no token created) and
+nothing is deployed. Both are configuration rather than code, thanks to
+`connection_args()`: the path — Replit Reserved VM background worker for the
+bot, Supabase for PostgreSQL, secrets in place of `.env` — is written down
+step by step in [DEPLOY.md](DEPLOY.md). Request-driven platforms (Cloud Run,
+Replit Autoscale) were rejected because a persistent gateway connection looks
+idle to a scale-to-zero platform.

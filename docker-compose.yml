@@ -25,6 +25,15 @@ services:
       # while the real data went to an anonymous one.
       - steam_pg_data:/var/lib/postgresql
 
+      # First-boot schema and seed data, so a fresh clone plus `compose up -d`
+      # yields tables, not an empty database. CAVEAT: initdb.d runs ONLY on
+      # the FIRST initialisation of an EMPTY data directory — an existing
+      # volume ignores these mounts entirely, so adding them changes nothing
+      # until `docker compose down -v`. (Verified against a throwaway compose
+      # project; do not test it by destroying the volume you are using.)
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./fixtures.sql:/docker-entrypoint-initdb.d/02-fixtures.sql:ro
+
     restart: unless-stopped
 
     # Lets `docker compose ps` distinguish "container running" from "Postgres

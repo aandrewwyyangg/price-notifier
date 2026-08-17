@@ -52,6 +52,24 @@ def build_price_drop_alert(
     )
 
 
+def build_watch_line(
+    appid: int,
+    name: str | None,
+    alert_below: int | None,
+    latest_cents: int | None,
+) -> str:
+    # format_price(None) renders "unavailable", which is exactly right for a
+    # watched game with no price history yet. The label falls back to the
+    # appid while name is NULL, same as every other output path.
+    label = user_game_label(appid, name)
+    line = f"{label} — latest price {format_price(latest_cents)}"
+
+    if alert_below is not None:
+        line += f", alerting below {format_price(alert_below)}"
+
+    return line
+
+
 def emit_user_alert(alert: UserAlert) -> None:
     # Temporary delivery sink until this becomes a Discord DM.
     print(f"{alert.discord_user_id}: {alert.message}")

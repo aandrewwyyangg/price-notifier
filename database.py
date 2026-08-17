@@ -13,7 +13,9 @@ from output import (
     log_operation,
 )
 from queries import (
+    DELETE_WATCH,
     ENSURE_GAME_EXISTS,
+    GET_USER_WATCHES,
     GET_WATCHED_APPIDS,
     INSERT_PRICE_IF_CHANGED,
     INSERT_WATCH,
@@ -24,6 +26,21 @@ from queries import (
 
 
 load_dotenv()
+
+
+@dataclass(frozen=True, slots=True)
+class WatchSummary:
+    """One row of a user's /list reply, straight from GET_USER_WATCHES.
+
+    name and latest_cents are each independently NULLable: a watched game may
+    have no name yet (never successfully polled) and no price history yet.
+    Rendering handles both — this type just carries them honestly.
+    """
+
+    appid: int
+    name: str | None
+    alert_below: int | None
+    latest_cents: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +125,36 @@ def create_watch(
         return False
 
     return True
+
+
+def delete_watch(discord_user_id: int, appid: int) -> bool:
+    """Remove one watch. False means there was nothing to remove.
+
+    Deleting zero rows is not an error, but the caller's reply differs —
+    "no longer watching" versus "you weren't watching that" — so the
+    distinction is returned rather than swallowed.
+    """
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                DELETE_WATCH,
+                {
+                    "discord_user_id": discord_user_id,
+                    "appid": appid,
+                },
+            )
+            return cur.fetchone() is not None
+
+
+def get_user_watches(discord_user_id: int) -> list[WatchSummary]:
+    """Everything /list needs, ordered by appid. Empty list is a normal answer."""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                GET_USER_WATCHES,
+                {"discord_user_id": discord_user_id},
+            )
+            return [WatchSummary(*row) for row in cur.fetchall()]
 
 
 def _run_poll_transaction(

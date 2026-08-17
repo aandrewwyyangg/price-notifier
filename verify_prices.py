@@ -31,7 +31,17 @@ cases = [
     ),
 ]
 
-conn = psycopg.connect(**connection_args())
+# This script reloads fixtures.sql, which TRUNCATEs every table it touches.
+# Rollback makes that safe locally, but pointing .env at a managed database
+# and running this would still take an ACCESS EXCLUSIVE lock on live tables —
+# so anything non-local is refused outright.
+connection_parameters = connection_args()
+assert connection_parameters["host"] in {"127.0.0.1", "localhost", "::1"}, (
+    f"Refusing to run fixtures against non-local host "
+    f"{connection_parameters['host']!r}"
+)
+
+conn = psycopg.connect(**connection_parameters)
 
 try:
     with conn.cursor() as cur:

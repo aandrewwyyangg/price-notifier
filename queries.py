@@ -82,6 +82,50 @@ RETURNING
 """
 
 
+# Keyed on the primary key, so this is an index lookup, not a scan. RETURNING
+# lets the caller distinguish "removed" from "you weren't watching that" —
+# deleting zero rows is not an error, but it is a different reply.
+# The games row is deliberately NOT deleted when the last watcher leaves:
+# prices is history worth keeping, the FK is ON DELETE RESTRICT so game
+# removal stays deliberate, and GET_WATCHED_APPIDS reads from watches — an
+# unwatched game stops being polled the moment this row is gone.
+DELETE_WATCH = """
+DELETE FROM watches
+WHERE discord_user_id = %(discord_user_id)s
+  AND appid = %(appid)s
+RETURNING appid;
+"""
+
+
+# The one query in the project that needs a JOIN: watches has the appid,
+# games has the name. /list DOES show the latest price — the LATERAL subquery
+# is the same latest-price-per-appid shape as INSERT_PRICE_IF_CHANGED's, and
+# a watch list without prices answers "what am I watching" but not "was the
+# threshold worth setting". LEFT JOIN LATERAL, not JOIN: a watched game with
+# no price history yet (fixture 1145360) must still appear, with cents NULL.
+# games.name can be NULL too (fixture 292030) — rendering falls back to the
+# appid, like every other output path.
+GET_USER_WATCHES = """
+SELECT
+    watches.appid,
+    games.name,
+    watches.alert_below,
+    latest.cents
+FROM watches
+JOIN games
+    ON games.appid = watches.appid
+LEFT JOIN LATERAL (
+    SELECT cents
+    FROM prices
+    WHERE prices.appid = watches.appid
+    ORDER BY checked_at DESC
+    LIMIT 1
+) AS latest ON TRUE
+WHERE watches.discord_user_id = %(discord_user_id)s
+ORDER BY watches.appid;
+"""
+
+
 # COALESCE(%(name)s, name) — direction matters and the two forms are opposites.
 # This one lets a supplied Steam name REPLACE the stored one, so renames
 # propagate, while a missing name preserves what is already there and a
