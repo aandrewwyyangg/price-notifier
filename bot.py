@@ -25,6 +25,11 @@ from steampricingproject import run_poll_cycle
 load_dotenv()
 POLL_INTERVAL_SECONDS = 900
 
+# games.appid and watches.alert_below are both INTEGER. A larger value raises
+# DataError, which is NOT an OperationalError — it would escape the handlers'
+# except clause and leave the interaction deferred but never answered.
+PG_INTEGER_MAX = 2147483647
+
 
 def require_bot_token() -> str:
     token = os.getenv("DISCORD_BOT_TOKEN")
@@ -100,7 +105,8 @@ def parse_price_to_cents(text: str) -> int | None:
         dollars = "0"
     if not (dollars.isdigit() and cents.isdigit() and len(cents) <= 2):
         return None
-    return int(dollars) * 100 + int(cents) * (10 if len(cents) == 1 else 1)
+    total = int(dollars) * 100 + int(cents) * (10 if len(cents) == 1 else 1)
+    return total if total <= PG_INTEGER_MAX else None
 
 @client.tree.command(name="watch", description="Get a DM when a game's price drops.")
 @app_commands.describe(
@@ -113,7 +119,7 @@ async def watch(
     alert_below: str | None = None,
 ) -> None:
     await interaction.response.defer(ephemeral=True)
-    if appid <= 0:
+    if not 0 < appid <= PG_INTEGER_MAX:
         await interaction.followup.send(
             "That doesn't look like a Steam appid — it's the positive number "
             "in the store URL, e.g. 620 for Portal 2."

@@ -1,20 +1,8 @@
-# Replit App configuration. The workspace Run button starts the bot; the
-# [deployment] block is what "Publish → Reserved VM" reads. See DEPLOY.md for
-# the whole path, including the Supabase and secrets setup this depends on.
-
 entrypoint = "bot.py"
 modules = ["python-3.13"]
-
 [env]
-# Python buffers stdout/stderr when they are not a TTY, and a deployment log
-# is not a TTY — without this the heartbeat lines sit in a buffer and the log
-# reads as "nothing is happening".
 PYTHONUNBUFFERED = "1"
-
 [deployment]
-# A Discord bot is a BACKGROUND WORKER: it holds a persistent gateway
-# connection and serves no HTTP. Only a Reserved VM fits that shape —
-# Autoscale is request-driven and would scale the gateway connection away.
 deploymentTarget = "vm"
 ignorePorts = true
 build = ["pip", "install", "-r", "requirements.txt"]

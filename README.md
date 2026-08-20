@@ -56,7 +56,7 @@ VM, all configuration rather than code — the exact steps are in
 | `schema.sql` | The DDL, written by hand. |
 | `fixtures.sql` | Repeatable seed data chosen to cover every nullable combination. |
 | `docker-compose.yml` | The local PostgreSQL, reproducible from the repo — first boot applies the schema. |
-| `verify_*.py` | Four test scripts (see [Tests](#tests)). |
+| `verify_*.py` | Five test scripts (see [Tests](#tests)). |
 | `DEPLOY.md` / `.replit` | The deployment path: Replit Reserved VM + Supabase. |
 
 ---
@@ -298,12 +298,21 @@ and ends with `All ... passed.`, or dies on an assertion.
 
 ```powershell
 .\venv\Scripts\python.exe verify_errors.py      # no DB, no network, instant
+.\venv\Scripts\python.exe verify_commands.py    # no DB, no gateway, instant
 .\venv\Scripts\python.exe verify_prices.py      # needs the container
 .\venv\Scripts\python.exe verify_watches.py     # needs the container
 .\venv\Scripts\python.exe verify_app_query.py   # needs the container
 ```
 
-All four are **hermetic**. The three database tests load `fixtures.sql`
+`verify_commands.py` drives the real slash-command callbacks against a fake
+`Interaction`, because a live bot only ever proves the happy path. Its most
+useful assertion is one a live test could not make: the mocked database
+function fails if `defer()` has not already been awaited. Without a defer, an
+unreachable database blows Discord's ~3s deadline and the user sees "The
+application did not respond" instead of the error we wrote — and every other
+test still passes.
+
+The three database tests are **hermetic**. They load `fixtures.sql`
 themselves, run everything on one connection, and roll back in a `finally`, so
 order does not matter and nothing needs reloading afterwards. Three things make
 that work:
@@ -343,6 +352,27 @@ alerts firing.
 
 The code was right. My explanation of *why* it was right was wrong, and nothing
 short of breaking it on purpose would have surfaced that.
+
+The same technique paid again when the command layer landed. Writing
+`verify_commands.py` surfaced a bug no amount of reading had: `appid` is a
+PostgreSQL `INTEGER`, and Discord will happily accept a number larger than
+one. The resulting `NumericValueOutOfRange` is a `DataError` — a *sibling* of
+`OperationalError`, not a subclass — so the handler's `except` clause does not
+catch it, the exception escapes, and the interaction stays deferred forever
+with no reply and no error the user can see. The fix is a range check in the
+handler, which is the same rule already applied to `alert_below`: **the CHECK
+constraint is a backstop, not input validation.**
+
+Curiously, `/unwatch` was never exposed to it. `DELETE ... WHERE appid = $1`
+promotes the comparison and simply matches nothing, so it answers "you weren't
+watching that" — correct, but by accident of PostgreSQL's type coercion rather
+than by design. Worth knowing which of your correct behaviours you actually
+built.
+
+Then the new tests were themselves mutation-tested: six deliberate bugs — both
+bounds removed, `defer()` moved after the database call, `Forbidden` re-raised
+instead of logged, the empty-price guard deleted, the duplicate-watch reply
+changed — and all six were caught.
 
 ---
 

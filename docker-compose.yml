@@ -1,50 +1,19 @@
-# Local development database.
-#
-# Requires a .env file in this directory (copy .env.example). Compose reads it
-# automatically; env_file also passes the same values into the container.
-#
-#   docker compose up -d          start
-#   docker compose down           stop (data survives — it's in a named volume)
-#   docker compose down -v        stop AND DESTROY the data
-#   docker compose exec db psql -U postgres -d steam_notifier
-
 services:
   db:
     image: postgres:18
     env_file: .env
-
     ports:
-      # Bound to localhost only. "5432:5432" would publish on 0.0.0.0 and
-      # expose the database to everything on the local network.
       - "127.0.0.1:5432:5432"
-
     volumes:
-      # Postgres 18 moved PGDATA to /var/lib/postgresql/18/docker and declares
-      # the volume one level up. Mounting /var/lib/postgresql/data here — the
-      # pre-18 convention — would create a named volume that holds nothing
-      # while the real data went to an anonymous one.
       - steam_pg_data:/var/lib/postgresql
-
-      # First-boot schema and seed data, so a fresh clone plus `compose up -d`
-      # yields tables, not an empty database. CAVEAT: initdb.d runs ONLY on
-      # the FIRST initialisation of an EMPTY data directory — an existing
-      # volume ignores these mounts entirely, so adding them changes nothing
-      # until `docker compose down -v`. (Verified against a throwaway compose
-      # project; do not test it by destroying the volume you are using.)
       - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
       - ./fixtures.sql:/docker-entrypoint-initdb.d/02-fixtures.sql:ro
-
     restart: unless-stopped
-
-    # Lets `docker compose ps` distinguish "container running" from "Postgres
-    # ready to accept connections". The $$ escapes compose's own variable
-    # substitution so the shell inside the container expands it instead.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
-
 volumes:
   steam_pg_data:
