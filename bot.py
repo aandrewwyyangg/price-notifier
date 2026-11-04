@@ -1,7 +1,8 @@
 import asyncio
 import os
+import re
 import sys
-
+from typing import Optional
 import discord
 import psycopg
 from discord import app_commands
@@ -9,52 +10,66 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 
 from database import (
-    connection_args,
+    MAX_WATCHES_PER_USER,
+    WatchResult,
     create_watch,
     delete_watch,
     get_user_watches,
+    missing_tables,
 )
 from output import (
     UserAlert,
     build_watch_line,
+    chunk_lines,
+    configure_logging,
     format_price,
+    log_exception,
     log_operation,
 )
-from steampricingproject import run_poll_cycle
+from steampricingproject import POLL_INTERVAL_SECONDS, run_poll_cycle
 
 load_dotenv()
-POLL_INTERVAL_SECONDS = 900
-
 PG_INTEGER_MAX = 2147483647
+MAX_PRICE_TEXT_LENGTH = 20
+PRICE_PATTERN = re.compile(r"\$?(\d*)(?:\.(\d{1,2}))?", re.ASCII)
+DATABASE_UNAVAILABLE = "The database is unreachable right now, please try again shortly."
+UNEXPECTED_ERROR = "Something went wrong on my end. Please try again later."
 
 
 def require_bot_token() -> str:
     token = os.getenv("DISCORD_BOT_TOKEN")
-    if token is None:
-        raise RuntimeError("DISCORD_BOT_TOKEN is not set")
+    if not token:
+        raise RuntimeError("DISCORD_BOT_TOKEN not set")
     return token
 
 
 def preflight() -> None:
     try:
-        with psycopg.connect(**connection_args()) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1;")
-                cur.fetchone()
+        missing = missing_tables()
     except Exception as error:
         log_operation(f"Startup preflight failed: {error}")
         sys.exit(1)
 
-    log_operation("Startup preflight passed: database reachable")
+    if missing:
+        log_operation(
+            f"Startup preflight failed: missing table(s) {', '.join(missing)}; "
+            "apply schema.sql to this database first"
+        )
+        sys.exit(1)
+
+    log_operation("Startup preflight passed: database reachable, schema present")
 
 class SteamNotifierClient(discord.Client):
     def __init__(self) -> None:
-        super().__init__(intents=discord.Intents.default())
+        super().__init__(
+            intents=discord.Intents.default(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
         guild_id = os.getenv("DISCORD_GUILD_ID")
-        if guild_id is not None:
+        if guild_id:
             guild = discord.Object(id=int(guild_id))
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
@@ -68,7 +83,11 @@ client = SteamNotifierClient()
 
 @tasks.loop(seconds=POLL_INTERVAL_SECONDS)
 async def poll_prices() -> None:
-    alerts = await asyncio.to_thread(run_poll_cycle)
+    try:
+        alerts = await asyncio.to_thread(run_poll_cycle)
+    except Exception:
+        log_exception("Poll cycle failed; the next cycle will try again")
+        return
     for alert in alerts:
         await deliver_alert(alert)
 
@@ -90,19 +109,42 @@ async def deliver_alert(alert: UserAlert) -> None:
             f"Could not DM user {alert.discord_user_id} "
             f"(appid {alert.appid}): {error}; alert dropped, ratchet stands"
         )
+    except Exception:
+        log_exception(
+            f"Unexpected error DMing user {alert.discord_user_id} "
+            f"(appid {alert.appid}); alert dropped, ratchet stands"
+        )
+
+async def reply(interaction: discord.Interaction, message: str) -> None:
+    await interaction.followup.send(message, ephemeral=True)
+
+@client.tree.error
+async def on_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+) -> None:
+    command = getattr(interaction, "command", None)
+    command_name = command.name if command is not None else "unknown"
+    log_exception(f"Unhandled error in /{command_name}", error)
+    try:
+        if interaction.response.is_done():
+            await reply(interaction, UNEXPECTED_ERROR)
+        else:
+            await interaction.response.send_message(UNEXPECTED_ERROR, ephemeral=True)
+    except discord.HTTPException:
+        pass
 
 def parse_price_to_cents(text: str) -> int | None:
-    amount = text.strip().removeprefix("$")
-    if amount == "":
+    amount = text.strip()
+    if len(amount) > MAX_PRICE_TEXT_LENGTH:
         return None
-    dollars, separator, cents = amount.partition(".")
-    if not separator:
-        cents = "0"
-    if dollars == "":
-        dollars = "0"
-    if not (dollars.isdigit() and cents.isdigit() and len(cents) <= 2):
+    match = PRICE_PATTERN.fullmatch(amount)
+    if match is None:
         return None
-    total = int(dollars) * 100 + int(cents) * (10 if len(cents) == 1 else 1)
+    dollars, cents = match.groups()
+    if not dollars and cents is None:
+        return None
+    total = int(dollars or "0") * 100 + int((cents or "0").ljust(2, "0"))
     return total if total <= PG_INTEGER_MAX else None
 
 @client.tree.command(name="watch", description="Get a DM when a game's price drops.")
@@ -112,14 +154,15 @@ def parse_price_to_cents(text: str) -> int | None:
 )
 async def watch(
     interaction: discord.Interaction,
-    appid: int,
-    alert_below: str | None = None,
+    appid: app_commands.Range[int, 1, PG_INTEGER_MAX],
+    alert_below: Optional[app_commands.Range[str, 1, MAX_PRICE_TEXT_LENGTH]] = None,
 ) -> None:
     await interaction.response.defer(ephemeral=True)
     if not 0 < appid <= PG_INTEGER_MAX:
-        await interaction.followup.send(
-            "That doesn't look like a Steam appid — it's the positive number "
-            "in the store URL, e.g. 620 for Portal 2."
+        await reply(
+            interaction,
+            "That doesn't look like a Steam appid. It's the number "
+            "in the store URL, e.g. 620 for Portal 2.",
         )
         return
 
@@ -129,26 +172,38 @@ async def watch(
         threshold_cents = parse_price_to_cents(alert_below)
 
         if threshold_cents is None:
-            await interaction.followup.send(
-                "I couldn't read that price — try something like 9.99 or 15."
-            )
+            await reply(interaction, "I couldn't read that price. Try a number like 9.99.")
+            return
+
+        if threshold_cents == 0:
+            await reply(interaction, "The alert price has to be more than $0.00.")
             return
 
     try:
-        created = await asyncio.to_thread(
+        result = await asyncio.to_thread(
             create_watch,
             interaction.user.id,
             appid,
             threshold_cents,
         )
     except psycopg.OperationalError:
-        await interaction.followup.send(
-            "The database is unreachable right now — please try again shortly."
+        await reply(interaction, DATABASE_UNAVAILABLE)
+        return
+
+    if result is WatchResult.ALREADY_WATCHING:
+        await reply(
+            interaction,
+            "You're already watching that game. To change its alert price, "
+            "/unwatch it and /watch it again.",
         )
         return
 
-    if not created:
-        await interaction.followup.send("You're already watching that game.")
+    if result is WatchResult.LIMIT_REACHED:
+        await reply(
+            interaction,
+            f"You're already watching {MAX_WATCHES_PER_USER} games, the most I allow. "
+            "/unwatch one to make room.",
+        )
         return
 
     threshold_text = (
@@ -156,18 +211,24 @@ async def watch(
         if threshold_cents is not None
         else ""
     )
-    await interaction.followup.send(
-        f"Watching appid {appid}. You'll get a DM when its price drops"
-        f"{threshold_text} — the first price I see sets the baseline, "
-        "silently. If Steam has no price for it (free-to-play or unreleased), "
-        "this watch stays quiet until Steam prices it."
+    await reply(
+        interaction,
+        f"Watching appid {appid}. You'll get a DM when its price drops{threshold_text}. "
+        "If Steam has no price for it (free to play or unreleased), "
+        "you won't hear anything until it does.",
     )
 
 
 @client.tree.command(name="unwatch", description="Stop watching a game.")
 @app_commands.describe(appid="The appid you watched, e.g. 620.")
-async def unwatch(interaction: discord.Interaction, appid: int) -> None:
+async def unwatch(
+    interaction: discord.Interaction,
+    appid: app_commands.Range[int, 1, PG_INTEGER_MAX],
+) -> None:
     await interaction.response.defer(ephemeral=True)
+    if not 0 < appid <= PG_INTEGER_MAX:
+        await reply(interaction, f"You weren't watching appid {appid}.")
+        return
 
     try:
         removed = await asyncio.to_thread(
@@ -176,17 +237,13 @@ async def unwatch(interaction: discord.Interaction, appid: int) -> None:
             appid,
         )
     except psycopg.OperationalError:
-        await interaction.followup.send(
-            "The database is unreachable right now — please try again shortly."
-        )
+        await reply(interaction, DATABASE_UNAVAILABLE)
         return
 
     if removed:
-        await interaction.followup.send(f"No longer watching appid {appid}.")
+        await reply(interaction, f"No longer watching appid {appid}.")
     else:
-        await interaction.followup.send(
-            f"You weren't watching appid {appid} — nothing to remove."
-        )
+        await reply(interaction, f"You weren't watching appid {appid}.")
 
 
 @client.tree.command(name="list", description="Show the games you're watching.")
@@ -199,15 +256,11 @@ async def list_watches(interaction: discord.Interaction) -> None:
             interaction.user.id,
         )
     except psycopg.OperationalError:
-        await interaction.followup.send(
-            "The database is unreachable right now — please try again shortly."
-        )
+        await reply(interaction, DATABASE_UNAVAILABLE)
         return
 
     if not watches:
-        await interaction.followup.send(
-            "You aren't watching anything yet. Try /watch."
-        )
+        await reply(interaction, "You aren't watching anything yet. Try /watch.")
         return
 
     lines = [
@@ -219,13 +272,15 @@ async def list_watches(interaction: discord.Interaction) -> None:
         )
         for watch_summary in watches
     ]
-    await interaction.followup.send("\n".join(lines))
+    for chunk in chunk_lines(lines):
+        await reply(interaction, chunk)
 
 
 def main() -> None:
+    configure_logging()
     token = require_bot_token()
     preflight()
-    client.run(token)
+    client.run(token, log_handler=None)
 
 if __name__ == "__main__":
     main()

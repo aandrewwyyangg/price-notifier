@@ -36,6 +36,21 @@ FROM watches
 ORDER BY appid;
 """
 
+GET_WATCH_COUNT_AND_DUPLICATE = """
+SELECT
+    count(*),
+    COALESCE(bool_or(appid = %(appid)s), FALSE)
+FROM watches
+WHERE discord_user_id = %(discord_user_id)s;
+"""
+
+FIND_MISSING_TABLES = """
+SELECT required.name
+FROM unnest(%(tables)s::text[]) AS required(name)
+WHERE to_regclass(required.name) IS NULL
+ORDER BY required.name;
+"""
+
 ENSURE_GAME_EXISTS = """
 INSERT INTO games (appid)
 VALUES (%(appid)s)

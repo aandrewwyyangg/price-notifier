@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 import psycopg
 from dotenv import load_dotenv
 
@@ -14,7 +15,9 @@ from output import (
 from queries import (
     DELETE_WATCH,
     ENSURE_GAME_EXISTS,
+    FIND_MISSING_TABLES,
     GET_USER_WATCHES,
+    GET_WATCH_COUNT_AND_DUPLICATE,
     GET_WATCHED_APPIDS,
     INSERT_PRICE_IF_CHANGED,
     INSERT_WATCH,
@@ -24,6 +27,14 @@ from queries import (
 )
 
 load_dotenv()
+
+MAX_WATCHES_PER_USER = int(os.getenv("MAX_WATCHES_PER_USER", "25"))
+REQUIRED_TABLES = ("games", "prices", "watches")
+
+class WatchResult(Enum):
+    CREATED = "created"
+    ALREADY_WATCHING = "already watching"
+    LIMIT_REACHED = "limit reached"
 
 @dataclass(frozen=True, slots=True)
 class WatchSummary:
@@ -43,7 +54,7 @@ def connection_args() -> dict:
     password = os.getenv("POSTGRES_PASSWORD")
     if password is None:
         raise RuntimeError("POSTGRES_PASSWORD is not set")
-    return {
+    args = {
         "host": os.getenv("POSTGRES_HOST", "127.0.0.1"),
         "port": int(os.getenv("POSTGRES_PORT", "5432")),
         "dbname": os.getenv("POSTGRES_DB", "steam_notifier"),
@@ -51,9 +62,19 @@ def connection_args() -> dict:
         "password": password,
         "connect_timeout": int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "10")),
     }
+    sslmode = os.getenv("POSTGRES_SSLMODE")
+    if sslmode:
+        args["sslmode"] = sslmode
+    return args
 
 def _connect():
     return psycopg.connect(**connection_args())
+
+def missing_tables() -> list[str]:
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(FIND_MISSING_TABLES, {"tables": list(REQUIRED_TABLES)})
+            return [row[0] for row in cur.fetchall()]
 
 def get_watched_appids() -> list[int]:
     with _connect() as conn:
@@ -65,7 +86,8 @@ def create_watch(
     discord_user_id: int,
     appid: int,
     alert_below: int | None = None,
-) -> bool:
+    max_watches: int = MAX_WATCHES_PER_USER,
+) -> WatchResult:
     parameters = {
         "discord_user_id": discord_user_id,
         "appid": appid,
@@ -74,6 +96,12 @@ def create_watch(
     try:
         with _connect() as conn:
             with conn.cursor() as cur:
+                cur.execute(GET_WATCH_COUNT_AND_DUPLICATE, parameters)
+                watch_count, already_watching = cur.fetchone()
+                if already_watching:
+                    return WatchResult.ALREADY_WATCHING
+                if watch_count >= max_watches:
+                    return WatchResult.LIMIT_REACHED
                 cur.execute(
                     ENSURE_GAME_EXISTS,
                     {"appid": appid},
@@ -81,8 +109,8 @@ def create_watch(
                 cur.execute(INSERT_WATCH, parameters)
                 cur.fetchone()
     except psycopg.errors.UniqueViolation:
-        return False
-    return True
+        return WatchResult.ALREADY_WATCHING
+    return WatchResult.CREATED
 
 def delete_watch(discord_user_id: int, appid: int) -> bool:
     with _connect() as conn:
