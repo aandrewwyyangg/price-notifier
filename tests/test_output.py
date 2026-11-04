@@ -32,6 +32,11 @@ def test_labels_use_the_name_when_there_is_one():
     assert log_game_label(620, "Portal 2") == "Portal 2 (620)"
 
 
+def test_user_labels_escape_discord_markdown_but_log_labels_stay_raw():
+    assert user_game_label(1, "*Hades* _II_") == r"\*Hades\* \_II\_"
+    assert log_game_label(1, "*Hades* _II_") == "*Hades* _II_ (1)"
+
+
 @pytest.mark.parametrize("name", [None, "", "   "])
 def test_labels_fall_back_to_the_appid(name):
     assert user_game_label(292030, name) == "appid 292030"

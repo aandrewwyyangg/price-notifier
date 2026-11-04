@@ -5,3 +5,9 @@ addopts = "-ra"
 markers = [
     "db: needs the local PostgreSQL from docker compose (skipped when unreachable, unless REQUIRE_DB=1)",
 ]
+filterwarnings = [
+    # discord.py 2.7.1's escape_markdown passes re.sub's count positionally,
+    # which Python 3.13+ deprecates. Harmless until Python removes it, and the
+    # tests would then fail loudly rather than warn.
+    "ignore:'count' is passed as positional argument:DeprecationWarning:discord.utils",
+]

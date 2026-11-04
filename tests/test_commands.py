@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -6,6 +7,7 @@ import aiohttp
 import discord
 import psycopg
 import pytest
+import requests
 from discord import app_commands
 
 import bot
@@ -13,6 +15,14 @@ from database import WatchResult
 
 ALICE = 100000000000000001
 PORTAL_2 = 620
+STEAM_PORTAL_2 = {"name": "Portal 2", "price": 999}
+
+
+@pytest.fixture(autouse=True)
+def steam_lookup():
+    """/watch looks the appid up on Steam; no test may reach the real API."""
+    with patch.object(bot, "get_game", return_value=STEAM_PORTAL_2) as get_game:
+        yield get_game
 
 
 def make_interaction(user_id=ALICE):
@@ -64,7 +74,10 @@ def test_watch_defers_first_parses_dollars_and_confirms_the_threshold():
     interaction.response.defer.assert_awaited_once_with(ephemeral=True)
     create_watch.assert_called_once_with(ALICE, PORTAL_2, 999)
     reply = only_reply(interaction)
-    assert "below $9.99" in reply
+    assert reply.startswith("Watching Portal 2.")
+    # The first price is a silent baseline, so a game already under the
+    # threshold stays quiet until it drops again. The reply has to say so.
+    assert "each new low below $9.99, counting from the first price I see" in reply
     assert "free to play or unreleased" in reply
 
 
@@ -75,7 +88,62 @@ def test_watch_without_a_threshold_passes_none():
         asyncio.run(bot.watch.callback(interaction, PORTAL_2, None))
 
     create_watch.assert_called_once_with(ALICE, PORTAL_2, None)
-    assert "below" not in only_reply(interaction)
+    reply = only_reply(interaction)
+    assert "below" not in reply
+    assert "each new low, counting from the first price I see" in reply
+
+
+def test_watch_asks_steam_only_after_deferring(steam_lookup):
+    interaction = make_interaction()
+    steam_lookup.side_effect = deferred_then(interaction, "the Steam lookup", STEAM_PORTAL_2)
+
+    with patch.object(bot, "create_watch", return_value=WatchResult.CREATED):
+        asyncio.run(bot.watch.callback(interaction, PORTAL_2, None))
+
+    steam_lookup.assert_called_once_with(PORTAL_2)
+
+
+def test_watch_refuses_an_appid_steam_does_not_list(steam_lookup):
+    interaction = make_interaction()
+    steam_lookup.return_value = None
+
+    with patch.object(bot, "create_watch") as create_watch:
+        asyncio.run(bot.watch.callback(interaction, 999_999_999, "9.99"))
+
+    create_watch.assert_not_called()
+    assert "couldn't find appid 999999999" in only_reply(interaction)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(requests.ConnectionError("steam unreachable"), id="Steam unreachable"),
+        pytest.param(requests.HTTPError("503 Server Error"), id="Steam server error"),
+        pytest.param(bot.SteamRateLimited("HTTP 429"), id="Steam rate limit"),
+    ],
+)
+def test_watch_is_saved_unchecked_when_steam_cannot_answer(steam_lookup, error):
+    interaction = make_interaction()
+    steam_lookup.side_effect = error
+
+    with patch.object(bot, "create_watch", return_value=WatchResult.CREATED) as create_watch:
+        with patch.object(bot, "log_operation") as log_operation:
+            asyncio.run(bot.watch.callback(interaction, PORTAL_2, None))
+
+    create_watch.assert_called_once_with(ALICE, PORTAL_2, None)
+    assert only_reply(interaction).startswith("Watching appid 620.")
+    log_operation.assert_called_once()
+    assert "unchecked" in log_operation.call_args.args[0]
+
+
+def test_watch_escapes_markdown_in_the_game_name(steam_lookup):
+    interaction = make_interaction()
+    steam_lookup.return_value = {"name": "*Hades*", "price": None}
+
+    with patch.object(bot, "create_watch", return_value=WatchResult.CREATED):
+        asyncio.run(bot.watch.callback(interaction, 1145360, None))
+
+    assert only_reply(interaction).startswith(r"Watching \*Hades\*.")
 
 
 def test_watch_reports_a_duplicate():
@@ -112,13 +180,14 @@ def test_watch_reports_the_per_user_limit():
         pytest.param(PORTAL_2, "0", id="price zero"),
     ],
 )
-def test_watch_rejects_bad_input_without_writing(appid, alert_below):
+def test_watch_rejects_bad_input_without_writing(appid, alert_below, steam_lookup):
     interaction = make_interaction()
 
     with patch.object(bot, "create_watch") as create_watch:
         asyncio.run(bot.watch.callback(interaction, appid, alert_below))
 
     create_watch.assert_not_called()
+    steam_lookup.assert_not_called()
     only_reply(interaction)
 
 
@@ -308,6 +377,16 @@ def test_the_command_error_handler_is_registered():
     assert bot.client.tree.on_error is bot.on_command_error
 
 
+def test_bot_messages_never_ping_anyone():
+    mentions = bot.client.allowed_mentions
+    assert (mentions.everyone, mentions.users, mentions.roles, mentions.replied_user) == (
+        False,
+        False,
+        False,
+        False,
+    )
+
+
 def test_command_errors_are_logged_and_answered():
     interaction = make_interaction()
     error = app_commands.CommandInvokeError(bot.watch, RuntimeError("boom"))
@@ -369,33 +448,47 @@ def test_require_bot_token(monkeypatch):
     assert bot.require_bot_token() == "not-a-real-token"
 
 
-def test_preflight_exits_when_the_database_is_unreachable():
+def app_log(caplog):
+    return [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.name == "steam_notifier"
+    ]
+
+
+def test_preflight_exits_with_an_error_when_the_database_is_unreachable(caplog):
     with patch.object(
         bot,
         "missing_tables",
         side_effect=psycopg.OperationalError("connection refused"),
     ):
-        with patch.object(bot, "log_operation") as log_operation:
+        with caplog.at_level(logging.INFO, logger="steam_notifier"):
             with pytest.raises(SystemExit) as exit_info:
                 bot.preflight()
 
     assert exit_info.value.code == 1
-    assert "connection refused" in log_operation.call_args.args[0]
+    ((level, message),) = app_log(caplog)
+    assert level == logging.ERROR
+    assert "connection refused" in message
 
 
-def test_preflight_exits_when_the_schema_is_missing():
+def test_preflight_exits_with_an_error_when_the_schema_is_missing(caplog):
     with patch.object(bot, "missing_tables", return_value=["watches"]):
-        with patch.object(bot, "log_operation") as log_operation:
+        with caplog.at_level(logging.INFO, logger="steam_notifier"):
             with pytest.raises(SystemExit) as exit_info:
                 bot.preflight()
 
     assert exit_info.value.code == 1
-    assert "watches" in log_operation.call_args.args[0]
+    ((level, message),) = app_log(caplog)
+    assert level == logging.ERROR
+    assert "watches" in message
 
 
-def test_preflight_passes_with_the_schema_present():
+def test_preflight_passes_with_the_schema_present(caplog):
     with patch.object(bot, "missing_tables", return_value=[]):
-        with patch.object(bot, "log_operation") as log_operation:
+        with caplog.at_level(logging.INFO, logger="steam_notifier"):
             bot.preflight()
 
-    assert "passed" in log_operation.call_args.args[0]
+    ((level, message),) = app_log(caplog)
+    assert level == logging.INFO
+    assert "passed" in message

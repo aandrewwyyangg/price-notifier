@@ -1,6 +1,8 @@
 import logging
 from dataclasses import dataclass
 
+from discord.utils import escape_markdown
+
 DISCORD_MESSAGE_LIMIT = 2000
 
 logger = logging.getLogger("steam_notifier")
@@ -17,7 +19,7 @@ def user_game_label(
     name: str | None,
 ) -> str:
     if isinstance(name, str) and name.strip():
-        return name
+        return escape_markdown(name)
 
     return f"appid {appid}"
 
@@ -97,6 +99,9 @@ def configure_logging(level: int = logging.INFO) -> None:
 
 def log_operation(message: str) -> None:
     logger.info(message)
+
+def log_error(message: str) -> None:
+    logger.error(message)
 
 def log_exception(message: str, error: BaseException | None = None) -> None:
     logger.error(message, exc_info=error if error is not None else True)

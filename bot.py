@@ -5,6 +5,7 @@ import sys
 from typing import Optional
 import discord
 import psycopg
+import requests
 from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
@@ -23,10 +24,17 @@ from output import (
     chunk_lines,
     configure_logging,
     format_price,
+    log_error,
     log_exception,
     log_operation,
+    user_game_label,
 )
-from steampricingproject import POLL_INTERVAL_SECONDS, run_poll_cycle
+from steampricingproject import (
+    POLL_INTERVAL_SECONDS,
+    SteamRateLimited,
+    get_game,
+    run_poll_cycle,
+)
 
 load_dotenv()
 PG_INTEGER_MAX = 2147483647
@@ -47,11 +55,11 @@ def preflight() -> None:
     try:
         missing = missing_tables()
     except Exception as error:
-        log_operation(f"Startup preflight failed: {error}")
+        log_error(f"Startup preflight failed: {error}")
         sys.exit(1)
 
     if missing:
-        log_operation(
+        log_error(
             f"Startup preflight failed: missing table(s) {', '.join(missing)}; "
             "apply schema.sql to this database first"
         )
@@ -179,6 +187,22 @@ async def watch(
             await reply(interaction, "The alert price has to be more than $0.00.")
             return
 
+    name = None
+    try:
+        game = await asyncio.to_thread(get_game, appid)
+    except (requests.RequestException, SteamRateLimited) as error:
+        # Steam being down shouldn't block a watch; the poller checks it later.
+        log_operation(f"Could not check appid {appid} with Steam: {error}; saving it unchecked")
+    else:
+        if game is None:
+            await reply(
+                interaction,
+                f"I couldn't find appid {appid} on the Steam store. It's the number "
+                "in the store URL, e.g. 620 for Portal 2.",
+            )
+            return
+        name = game["name"]
+
     try:
         result = await asyncio.to_thread(
             create_watch,
@@ -213,9 +237,9 @@ async def watch(
     )
     await reply(
         interaction,
-        f"Watching appid {appid}. You'll get a DM when its price drops{threshold_text}. "
-        "If Steam has no price for it (free to play or unreleased), "
-        "you won't hear anything until it does.",
+        f"Watching {user_game_label(appid, name)}. I'll DM you each new low{threshold_text}, "
+        "counting from the first price I see. If Steam has no price for it "
+        "(free to play or unreleased), you won't hear anything until it does.",
     )
 
 
