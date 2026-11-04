@@ -15,5 +15,16 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+  bot:
+    build: .
+    profiles: ["bot"]
+    env_file: .env
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
 volumes:
   steam_pg_data:
