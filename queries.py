@@ -31,9 +31,22 @@ RETURNING discord_user_id;
 """
 
 GET_WATCHED_APPIDS = """
-SELECT DISTINCT appid
-FROM watches
-ORDER BY appid;
+SELECT games.appid
+FROM games
+WHERE EXISTS (
+    SELECT 1
+    FROM watches
+    WHERE watches.appid = games.appid
+)
+ORDER BY games.last_checked_at ASC NULLS FIRST, games.appid;
+"""
+
+SET_STATEMENT_TIMEOUT = """
+SELECT set_config('statement_timeout', %(timeout)s, true);
+"""
+
+LOCK_USER_WATCHES = """
+SELECT pg_advisory_xact_lock(%(discord_user_id)s::bigint);
 """
 
 GET_WATCH_COUNT_AND_DUPLICATE = """

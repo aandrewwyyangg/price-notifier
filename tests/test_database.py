@@ -10,6 +10,7 @@ import pytest
 import database
 from database import WatchResult, WatchSummary
 from output import UserAlert, store_url
+from queries import LOCK_USER_WATCHES
 
 pytestmark = pytest.mark.db
 
@@ -64,6 +65,49 @@ def test_a_duplicate_is_reported_even_at_the_limit(app_db):
     assert database.create_watch(ALICE, 620, max_watches=2) is WatchResult.ALREADY_WATCHING
 
 
+def test_create_watch_waits_while_the_same_user_has_one_in_flight(app_db, other_connection):
+    # The other session is part-way through a /watch for Alice and holds her lock.
+    other_connection.execute(LOCK_USER_WATCHES, {"discord_user_id": ALICE})
+    app_db.execute("SET LOCAL lock_timeout = '200ms';")
+
+    with pytest.raises(psycopg.errors.LockNotAvailable):
+        database.create_watch(ALICE, 999_999_995)
+    assert watch_row(app_db, ALICE, 999_999_995) is None
+
+    # Other users don't share Alice's lock.
+    assert database.create_watch(NEW_USER, 999_999_995) is WatchResult.CREATED
+
+
+def test_a_duplicate_that_slips_past_the_check_is_still_reported(app_db, monkeypatch):
+    # The race the lock prevents: a check that ran before the other /watch
+    # committed. Only the primary key stops the insert, and it must still
+    # read as a duplicate rather than an error.
+    monkeypatch.setattr(
+        database,
+        "GET_WATCH_COUNT_AND_DUPLICATE",
+        "SELECT 0, FALSE WHERE %(discord_user_id)s IS NOT NULL;",
+    )
+
+    assert database.create_watch(ALICE, 620, 100) is WatchResult.ALREADY_WATCHING
+    assert watch_row(app_db, ALICE, 620) == (ALICE, 620, 500, 999)
+
+
+def test_every_connection_has_a_statement_timeout(db):
+    # The real _connect, not app_db's savepoint; it writes nothing.
+    with database._connect() as conn:
+        assert conn.execute("SHOW statement_timeout;").fetchone() == ("10s",)
+
+
+def test_a_statement_past_the_timeout_is_cancelled(db, monkeypatch):
+    monkeypatch.setattr(database, "STATEMENT_TIMEOUT", "50ms")
+    conn = database._connect()
+    try:
+        with pytest.raises(psycopg.errors.QueryCanceled):
+            conn.execute("SELECT pg_sleep(1);")
+    finally:
+        conn.close()
+
+
 def test_a_rejected_watch_rolls_back_its_game_row(app_db):
     with pytest.raises(psycopg.errors.CheckViolation):
         database.create_watch(NEW_USER, 999_999_997, alert_below=-1)
@@ -85,7 +129,7 @@ def test_get_user_watches_returns_summaries(app_db):
 
 
 def test_get_watched_appids_reads_the_poll_list(app_db):
-    assert database.get_watched_appids() == [620, 292030, 413150, 1145360]
+    assert database.get_watched_appids() == [1145360, 620, 292030, 413150]
 
 
 def test_missing_tables_is_empty_with_the_schema_applied(app_db):

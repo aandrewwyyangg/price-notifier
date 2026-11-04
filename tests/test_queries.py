@@ -94,7 +94,20 @@ def test_the_ratchet_alerts_only_on_new_lows_below_the_threshold(cur):
         assert users == expected_users, f"{label}: notified {users}"
 
 
-def test_get_watched_appids_lists_every_watched_game_once(cur):
+def test_get_watched_appids_lists_each_game_once_least_recently_checked_first(cur):
+    # Hades has never been checked, so it goes first. The other three were
+    # checked at the same moment and fall back to appid order.
+    cur.execute(GET_WATCHED_APPIDS)
+    assert [row[0] for row in cur.fetchall()] == [1145360, 620, 292030, 413150]
+
+
+def test_a_checked_game_moves_to_the_back_of_the_poll_list(cur):
+    # A game a rate limit cut off keeps its older timestamp, so it goes first
+    # next cycle instead of being skipped every time.
+    cur.execute(
+        RECORD_SUCCESSFUL_FETCH,
+        {"appid": 1145360, "name": "Hades", "observed_at": utc(2026, 7, 29, 12, 0)},
+    )
     cur.execute(GET_WATCHED_APPIDS)
     assert [row[0] for row in cur.fetchall()] == [620, 292030, 413150, 1145360]
 
@@ -126,7 +139,7 @@ def test_delete_watch_distinguishes_removed_from_absent_and_keeps_the_game(cur):
     assert cur.fetchone() is None
 
     cur.execute(GET_WATCHED_APPIDS)
-    assert [row[0] for row in cur.fetchall()] == [620, 292030, 1145360]
+    assert [row[0] for row in cur.fetchall()] == [1145360, 620, 292030]
     assert game_exists(cur, 413150)
 
 

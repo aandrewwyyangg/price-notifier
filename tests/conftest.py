@@ -25,29 +25,47 @@ def _database_unavailable(reason: str) -> None:
     pytest.skip(f"local PostgreSQL unavailable: {reason}")
 
 
-@pytest.fixture
-def db():
-    """A connection with fresh fixtures loaded, rolled back after the test.
-
-    TRUNCATE is transactional in PostgreSQL, so nothing a test does survives.
-    """
+def _connect_locally() -> psycopg.Connection:
     try:
         params = database.connection_args()
     except RuntimeError as error:
         _database_unavailable(str(error))
     if params["host"] not in LOCAL_HOSTS:
         pytest.fail(
-            f"refusing to load fixtures into non-local host {params['host']!r}; "
+            f"refusing to run database tests against non-local host {params['host']!r}; "
             "point POSTGRES_HOST at the local compose database"
         )
     params["connect_timeout"] = 5
     try:
-        conn = psycopg.connect(**params)
+        return psycopg.connect(**params)
     except psycopg.OperationalError as error:
         _database_unavailable(str(error))
+
+
+@pytest.fixture
+def db():
+    """A connection with fresh fixtures loaded, rolled back after the test.
+
+    TRUNCATE is transactional in PostgreSQL, so nothing a test does survives.
+    """
+    conn = _connect_locally()
     try:
         with conn.cursor() as cur:
             cur.execute(FIXTURE_SQL)
+        yield conn
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+@pytest.fixture
+def other_connection(db):
+    """A second session, for tests where two sessions compete for a lock.
+
+    It never touches the tables db truncated, and it is rolled back too.
+    """
+    conn = _connect_locally()
+    try:
         yield conn
     finally:
         conn.rollback()

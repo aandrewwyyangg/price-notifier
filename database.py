@@ -21,15 +21,18 @@ from queries import (
     GET_WATCHED_APPIDS,
     INSERT_PRICE_IF_CHANGED,
     INSERT_WATCH,
+    LOCK_USER_WATCHES,
     RATCHET_WATCHERS_TO_NOTIFY,
     RECORD_SUCCESSFUL_FETCH,
     SEED_WATCH_RATCHETS,
+    SET_STATEMENT_TIMEOUT,
 )
 
 load_dotenv()
 
 MAX_WATCHES_PER_USER = int(os.getenv("MAX_WATCHES_PER_USER", "25"))
 REQUIRED_TABLES = ("games", "prices", "watches")
+STATEMENT_TIMEOUT = "10s"
 
 class WatchResult(Enum):
     CREATED = "created"
@@ -68,7 +71,15 @@ def connection_args() -> dict:
     return args
 
 def _connect():
-    return psycopg.connect(**connection_args())
+    conn = psycopg.connect(**connection_args())
+    try:
+        # Local to the transaction each caller runs, so it never leaks
+        # through a connection pooler to another session.
+        conn.execute(SET_STATEMENT_TIMEOUT, {"timeout": STATEMENT_TIMEOUT})
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 def missing_tables() -> list[str]:
     with _connect() as conn:
@@ -96,6 +107,9 @@ def create_watch(
     try:
         with _connect() as conn:
             with conn.cursor() as cur:
+                # Held until commit: one user's /watch commands take turns,
+                # so two at once can't both pass the limit check.
+                cur.execute(LOCK_USER_WATCHES, parameters)
                 cur.execute(GET_WATCH_COUNT_AND_DUPLICATE, parameters)
                 watch_count, already_watching = cur.fetchone()
                 if already_watching:
