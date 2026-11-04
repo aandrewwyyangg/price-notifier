@@ -1,0 +1,401 @@
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+import aiohttp
+import discord
+import psycopg
+import pytest
+from discord import app_commands
+
+import bot
+from database import WatchResult
+
+ALICE = 100000000000000001
+PORTAL_2 = 620
+
+
+def make_interaction(user_id=ALICE):
+    interaction = SimpleNamespace()
+    interaction.user = SimpleNamespace(id=user_id)
+    interaction.command = SimpleNamespace(name="watch")
+    interaction.response = SimpleNamespace(
+        defer=AsyncMock(),
+        is_done=Mock(return_value=True),
+        send_message=AsyncMock(),
+    )
+    interaction.followup = SimpleNamespace(send=AsyncMock())
+    return interaction
+
+
+def replies(interaction):
+    calls = interaction.followup.send.call_args_list
+    for call in calls:
+        # The first followup inherits the deferred response's privacy.
+        # Later followups need ephemeral=True or they default to public.
+        assert call.kwargs.get("ephemeral") is True, f"public reply: {call}"
+    return [call.args[0] for call in calls]
+
+
+def only_reply(interaction):
+    sent = replies(interaction)
+    assert len(sent) == 1, f"expected exactly one reply, got {sent}"
+    return sent[0]
+
+
+def deferred_then(interaction, name, return_value):
+    def check(*args, **kwargs):
+        assert interaction.response.defer.called, (
+            f"{name} reached the database before defer()"
+        )
+        return return_value
+    return check
+
+
+def test_watch_defers_first_parses_dollars_and_confirms_the_threshold():
+    interaction = make_interaction()
+
+    with patch.object(bot, "create_watch") as create_watch:
+        create_watch.side_effect = deferred_then(
+            interaction, "/watch", WatchResult.CREATED
+        )
+        asyncio.run(bot.watch.callback(interaction, PORTAL_2, "9.99"))
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    create_watch.assert_called_once_with(ALICE, PORTAL_2, 999)
+    reply = only_reply(interaction)
+    assert "below $9.99" in reply
+    assert "free to play or unreleased" in reply
+
+
+def test_watch_without_a_threshold_passes_none():
+    interaction = make_interaction()
+
+    with patch.object(bot, "create_watch", return_value=WatchResult.CREATED) as create_watch:
+        asyncio.run(bot.watch.callback(interaction, PORTAL_2, None))
+
+    create_watch.assert_called_once_with(ALICE, PORTAL_2, None)
+    assert "below" not in only_reply(interaction)
+
+
+def test_watch_reports_a_duplicate():
+    interaction = make_interaction()
+
+    with patch.object(bot, "create_watch", return_value=WatchResult.ALREADY_WATCHING):
+        asyncio.run(bot.watch.callback(interaction, PORTAL_2, None))
+
+    assert only_reply(interaction).startswith("You're already watching that game.")
+
+
+def test_watch_reports_the_per_user_limit():
+    interaction = make_interaction()
+
+    with patch.object(bot, "create_watch", return_value=WatchResult.LIMIT_REACHED):
+        asyncio.run(bot.watch.callback(interaction, PORTAL_2, None))
+
+    reply = only_reply(interaction)
+    assert str(bot.MAX_WATCHES_PER_USER) in reply
+    assert "/unwatch" in reply
+
+
+@pytest.mark.parametrize(
+    ("appid", "alert_below"),
+    [
+        pytest.param(0, None, id="appid zero"),
+        pytest.param(-5, None, id="appid negative"),
+        pytest.param(bot.PG_INTEGER_MAX + 1, None, id="appid past INTEGER max"),
+        pytest.param(PORTAL_2, "nine dollars", id="price unparseable"),
+        pytest.param(PORTAL_2, "   ", id="price empty"),
+        pytest.param(PORTAL_2, "99999999999.99", id="price past INTEGER max"),
+        pytest.param(PORTAL_2, "²", id="price superscript digit"),
+        pytest.param(PORTAL_2, "9" * 6000, id="price 6000 digits"),
+        pytest.param(PORTAL_2, "0", id="price zero"),
+    ],
+)
+def test_watch_rejects_bad_input_without_writing(appid, alert_below):
+    interaction = make_interaction()
+
+    with patch.object(bot, "create_watch") as create_watch:
+        asyncio.run(bot.watch.callback(interaction, appid, alert_below))
+
+    create_watch.assert_not_called()
+    only_reply(interaction)
+
+
+@pytest.mark.parametrize(
+    ("database_function", "invoke"),
+    [
+        ("create_watch", lambda i: bot.watch.callback(i, PORTAL_2, None)),
+        ("delete_watch", lambda i: bot.unwatch.callback(i, PORTAL_2)),
+        ("get_user_watches", lambda i: bot.list_watches.callback(i)),
+    ],
+    ids=["/watch", "/unwatch", "/list"],
+)
+def test_an_unreachable_database_is_answered_not_raised(database_function, invoke):
+    interaction = make_interaction()
+
+    with patch.object(
+        bot,
+        database_function,
+        side_effect=psycopg.OperationalError("database unavailable"),
+    ):
+        asyncio.run(invoke(interaction))
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    assert "try again shortly" in only_reply(interaction)
+
+
+@pytest.mark.parametrize(
+    ("removed", "expected"),
+    [(True, "No longer watching"), (False, "weren't watching")],
+)
+def test_unwatch_distinguishes_removed_from_not_watching(removed, expected):
+    interaction = make_interaction()
+
+    with patch.object(bot, "delete_watch") as delete_watch:
+        delete_watch.side_effect = deferred_then(interaction, "/unwatch", removed)
+        asyncio.run(bot.unwatch.callback(interaction, PORTAL_2))
+
+    delete_watch.assert_called_once_with(ALICE, PORTAL_2)
+    assert expected in only_reply(interaction)
+
+
+def test_unwatch_answers_an_out_of_range_appid_without_a_query():
+    interaction = make_interaction()
+
+    with patch.object(bot, "delete_watch") as delete_watch:
+        asyncio.run(bot.unwatch.callback(interaction, bot.PG_INTEGER_MAX + 1))
+
+    delete_watch.assert_not_called()
+    assert "weren't watching" in only_reply(interaction)
+
+
+def test_list_answers_an_empty_watch_list():
+    interaction = make_interaction()
+
+    with patch.object(bot, "get_user_watches", return_value=[]):
+        asyncio.run(bot.list_watches.callback(interaction))
+
+    assert "aren't watching anything" in only_reply(interaction)
+
+
+def test_list_renders_a_null_name_and_a_null_price():
+    interaction = make_interaction()
+    listed = [
+        SimpleNamespace(appid=PORTAL_2, name="Portal 2", alert_below=500, latest_cents=999),
+        SimpleNamespace(appid=292030, name=None, alert_below=None, latest_cents=None),
+    ]
+
+    with patch.object(bot, "get_user_watches") as get_user_watches:
+        get_user_watches.side_effect = deferred_then(interaction, "/list", listed)
+        asyncio.run(bot.list_watches.callback(interaction))
+
+    rendered = only_reply(interaction)
+    assert "Portal 2 — latest price $9.99, alerting below $5.00" in rendered
+    assert "appid 292030 — latest price unavailable" in rendered
+
+
+def test_list_splits_a_long_list_into_private_messages_under_the_limit():
+    interaction = make_interaction()
+    listed = [
+        SimpleNamespace(
+            appid=100000 + index,
+            name="An Extremely Long Game Name " * 4,
+            alert_below=500,
+            latest_cents=999,
+        )
+        for index in range(40)
+    ]
+
+    with patch.object(bot, "get_user_watches", return_value=listed):
+        asyncio.run(bot.list_watches.callback(interaction))
+
+    sent = replies(interaction)
+    assert len(sent) > 1
+    assert all(len(message) <= 2000 for message in sent)
+    assert len("\n".join(sent).split("\n")) == len(listed)
+
+
+ALERT = bot.UserAlert(
+    discord_user_id=ALICE,
+    appid=PORTAL_2,
+    message="Portal 2 dropped to $4.99.",
+)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(
+            discord.Forbidden(Mock(status=403, reason="Forbidden"), "cannot send messages to this user"),
+            id="DMs closed",
+        ),
+        pytest.param(
+            discord.NotFound(Mock(status=404, reason="Not Found"), "unknown user"),
+            id="unknown user",
+        ),
+        pytest.param(
+            discord.HTTPException(Mock(status=503, reason="Service Unavailable"), "unavailable"),
+            id="transient HTTP",
+        ),
+    ],
+)
+def test_deliver_alert_logs_http_failures_without_raising(error):
+    with patch.object(bot.client, "fetch_user", side_effect=error):
+        with patch.object(bot, "log_operation") as log_operation:
+            asyncio.run(bot.deliver_alert(ALERT))
+
+    log_operation.assert_called_once()
+    logged = log_operation.call_args.args[0]
+    assert str(ALICE) in logged and str(PORTAL_2) in logged
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(OSError("network unreachable"), id="OSError"),
+        pytest.param(asyncio.TimeoutError(), id="timeout"),
+        pytest.param(aiohttp.ClientConnectionError("connection reset"), id="aiohttp"),
+    ],
+)
+def test_deliver_alert_survives_network_errors(error):
+    with patch.object(bot.client, "fetch_user", side_effect=error):
+        with patch.object(bot, "log_exception") as log_exception:
+            asyncio.run(bot.deliver_alert(ALERT))
+
+    log_exception.assert_called_once()
+    assert str(ALICE) in log_exception.call_args.args[0]
+
+
+def test_deliver_alert_sends_the_message_and_logs_nothing():
+    recipient = SimpleNamespace(send=AsyncMock())
+
+    with patch.object(bot, "log_operation") as log_operation:
+        with patch.object(
+            bot.client, "fetch_user", new=AsyncMock(return_value=recipient)
+        ) as fetch_user:
+            asyncio.run(bot.deliver_alert(ALERT))
+
+    fetch_user.assert_awaited_once_with(ALICE)
+    recipient.send.assert_awaited_once_with(ALERT.message)
+    log_operation.assert_not_called()
+
+
+def test_poll_delivers_every_alert_in_order():
+    alerts = [
+        bot.UserAlert(discord_user_id=1, appid=PORTAL_2, message="first"),
+        bot.UserAlert(discord_user_id=2, appid=PORTAL_2, message="second"),
+    ]
+
+    with patch.object(bot, "run_poll_cycle", return_value=alerts):
+        with patch.object(bot, "deliver_alert", new=AsyncMock()) as deliver_alert:
+            asyncio.run(bot.poll_prices.coro())
+
+    assert [call.args[0] for call in deliver_alert.await_args_list] == alerts
+
+
+def test_poll_survives_an_unexpected_cycle_error():
+    with patch.object(bot, "run_poll_cycle", side_effect=RuntimeError("schema drift")):
+        with patch.object(bot, "deliver_alert", new=AsyncMock()) as deliver_alert:
+            with patch.object(bot, "log_exception") as log_exception:
+                asyncio.run(bot.poll_prices.coro())
+
+    deliver_alert.assert_not_awaited()
+    log_exception.assert_called_once()
+
+
+def test_the_command_error_handler_is_registered():
+    assert bot.client.tree.on_error is bot.on_command_error
+
+
+def test_command_errors_are_logged_and_answered():
+    interaction = make_interaction()
+    error = app_commands.CommandInvokeError(bot.watch, RuntimeError("boom"))
+
+    with patch.object(bot, "log_exception") as log_exception:
+        asyncio.run(bot.on_command_error(interaction, error))
+
+    log_exception.assert_called_once()
+    assert only_reply(interaction) == bot.UNEXPECTED_ERROR
+
+
+def test_command_errors_before_defer_use_the_initial_response():
+    interaction = make_interaction()
+    interaction.response.is_done = Mock(return_value=False)
+    error = app_commands.CommandInvokeError(bot.watch, RuntimeError("boom"))
+
+    with patch.object(bot, "log_exception"):
+        asyncio.run(bot.on_command_error(interaction, error))
+
+    interaction.response.send_message.assert_awaited_once_with(
+        bot.UNEXPECTED_ERROR, ephemeral=True
+    )
+    interaction.followup.send.assert_not_awaited()
+
+
+@pytest.mark.parametrize("guild_id", [None, "", "100000000000000003"])
+def test_setup_syncs_commands_then_starts_the_poller(monkeypatch, guild_id):
+    if guild_id is None:
+        monkeypatch.delenv("DISCORD_GUILD_ID", raising=False)
+    else:
+        monkeypatch.setenv("DISCORD_GUILD_ID", guild_id)
+
+    with patch.object(bot.client.tree, "copy_global_to") as copy_global_to:
+        with patch.object(bot.client.tree, "sync", new=AsyncMock()) as sync:
+            with patch.object(bot.poll_prices, "start") as start:
+                start.side_effect = sync.assert_awaited_once
+                asyncio.run(bot.client.setup_hook())
+
+    if guild_id:
+        guild = discord.Object(id=int(guild_id))
+        copy_global_to.assert_called_once_with(guild=guild)
+        sync.assert_awaited_once_with(guild=guild)
+    else:
+        copy_global_to.assert_not_called()
+        sync.assert_awaited_once_with()
+    start.assert_called_once_with()
+
+
+def test_require_bot_token(monkeypatch):
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+    with pytest.raises(RuntimeError):
+        bot.require_bot_token()
+
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "")
+    with pytest.raises(RuntimeError):
+        bot.require_bot_token()
+
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "not-a-real-token")
+    assert bot.require_bot_token() == "not-a-real-token"
+
+
+def test_preflight_exits_when_the_database_is_unreachable():
+    with patch.object(
+        bot,
+        "missing_tables",
+        side_effect=psycopg.OperationalError("connection refused"),
+    ):
+        with patch.object(bot, "log_operation") as log_operation:
+            with pytest.raises(SystemExit) as exit_info:
+                bot.preflight()
+
+    assert exit_info.value.code == 1
+    assert "connection refused" in log_operation.call_args.args[0]
+
+
+def test_preflight_exits_when_the_schema_is_missing():
+    with patch.object(bot, "missing_tables", return_value=["watches"]):
+        with patch.object(bot, "log_operation") as log_operation:
+            with pytest.raises(SystemExit) as exit_info:
+                bot.preflight()
+
+    assert exit_info.value.code == 1
+    assert "watches" in log_operation.call_args.args[0]
+
+
+def test_preflight_passes_with_the_schema_present():
+    with patch.object(bot, "missing_tables", return_value=[]):
+        with patch.object(bot, "log_operation") as log_operation:
+            bot.preflight()
+
+    assert "passed" in log_operation.call_args.args[0]
