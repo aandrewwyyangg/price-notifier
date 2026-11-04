@@ -25,9 +25,6 @@ from steampricingproject import run_poll_cycle
 load_dotenv()
 POLL_INTERVAL_SECONDS = 900
 
-# games.appid and watches.alert_below are both INTEGER. A larger value raises
-# DataError, which is NOT an OperationalError — it would escape the handlers'
-# except clause and leave the interaction deferred but never answered.
 PG_INTEGER_MAX = 2147483647
 
 
@@ -110,8 +107,8 @@ def parse_price_to_cents(text: str) -> int | None:
 
 @client.tree.command(name="watch", description="Get a DM when a game's price drops.")
 @app_commands.describe(
-    appid="The number in the store URL, e.g. 620 for Portal 2.",
-    alert_below="Only alert below this price in USD, e.g. 9.99. Empty = every new low.",
+    appid="The number in the store URL.",
+    alert_below="Only alert below this price in USD.",
 )
 async def watch(
     interaction: discord.Interaction,
