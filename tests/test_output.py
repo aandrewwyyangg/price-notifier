@@ -71,7 +71,7 @@ def test_price_drop_alert_falls_back_to_the_appid_for_a_null_name():
 
 def test_watch_line_renders_a_null_price_and_a_threshold():
     assert build_watch_line(1145360, "Hades", 1500, None) == (
-        "Hades — latest price unavailable, alerting below $15.00"
+        "Hades (appid 1145360) — latest price unavailable, alerting below $15.00"
     )
 
 

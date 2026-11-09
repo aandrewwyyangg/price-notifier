@@ -260,7 +260,7 @@ def test_list_renders_a_null_name_and_a_null_price():
         asyncio.run(bot.list_watches.callback(interaction))
 
     rendered = only_reply(interaction)
-    assert "Portal 2 — latest price $9.99, alerting below $5.00" in rendered
+    assert "Portal 2 (appid 620) — latest price $9.99, alerting below $5.00" in rendered
     assert "appid 292030 — latest price unavailable" in rendered
 
 

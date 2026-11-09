@@ -63,6 +63,8 @@ def build_watch_line(
     latest_cents: int | None,
 ) -> str:
     label = user_game_label(appid, name)
+    if isinstance(name, str) and name.strip():
+        label = f"{label} (appid {appid})"
     line = f"{label} — latest price {format_price(latest_cents)}"
     if alert_below is not None:
         line += f", alerting below {format_price(alert_below)}"
