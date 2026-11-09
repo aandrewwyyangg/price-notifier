@@ -1,4 +1,5 @@
 from unittest.mock import Mock, patch
+from threading import Event
 
 import psycopg
 import pytest
@@ -160,6 +161,29 @@ def test_a_steam_rate_limit_keeps_alerts_collected_before_it():
     assert alerts == [FIRST_ALERT]
     assert [call.args[0] for call in get_game.call_args_list] == [FIRST_APPID, SECOND_APPID]
     assert processed_appids(process_price_observation) == [FIRST_APPID]
+
+
+def test_stopping_a_cycle_keeps_collected_alerts_and_skips_remaining_games():
+    stopped = Event()
+
+    def first_game(appid, stop_event):
+        assert appid == FIRST_APPID
+        stopped.set()
+        return [FIRST_ALERT]
+
+    with patch.object(poller, "check_one", side_effect=first_game) as check_one:
+        alerts = poller.check_all([FIRST_APPID, SECOND_APPID], stopped)
+
+    assert alerts == [FIRST_ALERT]
+    check_one.assert_called_once_with(FIRST_APPID, stopped)
+
+
+def test_a_stopped_poller_does_not_query_the_database():
+    stopped = Event()
+    stopped.set()
+    with patch.object(poller, "get_watched_appids") as get_watched_appids:
+        assert poller.run_poll_cycle(stopped) == []
+    get_watched_appids.assert_not_called()
 
 
 def steam_response(payload, status=200):

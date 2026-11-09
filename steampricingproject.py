@@ -1,6 +1,7 @@
 import os
 import time
 from datetime import datetime, timezone
+from threading import Event
 import psycopg
 import requests
 from dotenv import load_dotenv
@@ -82,13 +83,16 @@ def get_game(appid, cc=None):
         "price": price,
     }
 
-def check_one(appid):
+def check_one(appid, stop_event: Event | None = None):
     try:
         game = get_game(appid)
     except requests.RequestException as e:
         log_operation(
             f"Request failed for appid {appid}: {e}"
         )
+        return []
+
+    if stop_event is not None and stop_event.is_set():
         return []
 
     if game is None:
@@ -112,15 +116,20 @@ def check_one(appid):
         )
         return []
 
-def check_all(appids):
+def check_all(appids, stop_event: Event | None = None):
     collected_alerts = []
 
     for index, appid in enumerate(appids):
+        if stop_event is not None and stop_event.is_set():
+            break
         if index > 0:
-            time.sleep(REQUEST_SPACING_SECONDS)
+            if stop_event is None:
+                time.sleep(REQUEST_SPACING_SECONDS)
+            elif stop_event.wait(REQUEST_SPACING_SECONDS):
+                break
 
         try:
-            collected_alerts.extend(check_one(appid))
+            collected_alerts.extend(check_one(appid, stop_event))
         except SteamRateLimited:
             log_operation(
                 f"Steam rate limit hit at appid {appid}; ending this cycle "
@@ -134,7 +143,9 @@ def check_all(appids):
 
     return collected_alerts
 
-def run_poll_cycle():
+def run_poll_cycle(stop_event: Event | None = None):
+    if stop_event is not None and stop_event.is_set():
+        return []
     try:
         appids = get_watched_appids()
     except psycopg.OperationalError as e:
@@ -143,7 +154,7 @@ def run_poll_cycle():
         )
         return []
 
-    return check_all(appids)
+    return check_all(appids, stop_event)
 
 if __name__ == "__main__":
     configure_logging()

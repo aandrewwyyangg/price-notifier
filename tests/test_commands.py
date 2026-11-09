@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -11,6 +12,7 @@ import requests
 from discord import app_commands
 
 import bot
+import steampricingproject as poller
 from database import WatchResult
 
 ALICE = 100000000000000001
@@ -371,6 +373,57 @@ def test_poll_survives_an_unexpected_cycle_error():
 
     deliver_alert.assert_not_awaited()
     log_exception.assert_called_once()
+
+
+def test_cancelling_a_poll_stops_its_worker_before_writing_or_fetching_again():
+    started, release, finished = Event(), Event(), Event()
+    stop = Event()
+    original_cycle = poller.run_poll_cycle
+
+    def get_game(appid):
+        started.set()
+        assert release.wait(2)
+        return STEAM_PORTAL_2
+
+    def run_cycle(stop_event):
+        try:
+            return original_cycle(stop_event)
+        finally:
+            finished.set()
+
+    async def cancel_in_flight():
+        task = asyncio.create_task(bot.poll_prices.coro())
+        try:
+            assert await asyncio.to_thread(started.wait, 2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+
+    with patch.object(bot.client, "poll_stop", stop):
+        with patch.object(bot, "run_poll_cycle", side_effect=run_cycle):
+            with patch.object(poller, "get_watched_appids", return_value=[620, 570]):
+                with patch.object(poller, "get_game", side_effect=get_game) as fetch:
+                    with patch.object(poller, "process_price_observation") as process:
+                        asyncio.run(cancel_in_flight())
+
+    assert stop.is_set()
+    fetch.assert_called_once_with(620)
+    process.assert_not_called()
+
+
+def test_closing_the_client_stops_polling_before_closing_discord():
+    client = bot.SteamNotifierClient()
+
+    async def close_discord():
+        assert client.poll_stop.is_set()
+        cancel.assert_called_once_with()
+
+    with patch.object(bot.poll_prices, "cancel") as cancel:
+        with patch.object(discord.Client, "close", new=AsyncMock(side_effect=close_discord)):
+            asyncio.run(client.close())
 
 
 def test_the_command_error_handler_is_registered():

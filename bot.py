@@ -1,7 +1,9 @@
 import asyncio
 import os
 import re
+import signal
 import sys
+from threading import Event
 from typing import Optional
 import discord
 import psycopg
@@ -74,8 +76,10 @@ class SteamNotifierClient(discord.Client):
             allowed_mentions=discord.AllowedMentions.none(),
         )
         self.tree = app_commands.CommandTree(self)
+        self.poll_stop = Event()
 
     async def setup_hook(self) -> None:
+        self.poll_stop.clear()
         guild_id = os.getenv("DISCORD_GUILD_ID")
         if guild_id:
             guild = discord.Object(id=int(guild_id))
@@ -86,13 +90,23 @@ class SteamNotifierClient(discord.Client):
             await self.tree.sync()
             log_operation("Command tree synced globally")
         poll_prices.start()
+
+    async def close(self) -> None:
+        self.poll_stop.set()
+        poll_prices.cancel()
+        await super().close()
+
 client = SteamNotifierClient()
 
 
 @tasks.loop(seconds=POLL_INTERVAL_SECONDS)
 async def poll_prices() -> None:
     try:
-        alerts = await asyncio.to_thread(run_poll_cycle)
+        alerts = await asyncio.to_thread(run_poll_cycle, client.poll_stop)
+    except asyncio.CancelledError:
+        # Cancelling to_thread does not stop its worker thread.
+        client.poll_stop.set()
+        raise
     except Exception:
         log_exception("Poll cycle failed; the next cycle will try again")
         return
@@ -304,6 +318,8 @@ def main() -> None:
     configure_logging()
     token = require_bot_token()
     preflight()
+    # VM hosts commonly send SIGTERM; use asyncio's SIGINT cleanup path.
+    signal.signal(signal.SIGTERM, lambda *_: signal.raise_signal(signal.SIGINT))
     client.run(token, log_handler=None)
 
 if __name__ == "__main__":
