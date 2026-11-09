@@ -92,13 +92,21 @@ The database tests load `fixtures.sql` inside a transaction and roll it back aft
 
 The bot keeps a persistent outbound connection to Discord and serves no HTTP, so it needs an always-on host. Scale-to-zero platforms such as Cloud Run or Replit Autoscale see it as idle.
 
-1. Create the database (Supabase's free tier works) and apply `schema.sql` once. Never load `fixtures.sql` into production.
-2. On Supabase, use the **session** pooler: the direct host can be IPv6-only, and the transaction pooler breaks psycopg's prepared statements. Set `POSTGRES_SSLMODE=require`.
-3. Run the bot with the variables above, either way:
-   - **Replit:** `.replit` publishes it as a Reserved VM background worker. Put the variables in Secrets.
-   - **Any Docker host**, such as a small GCE VM: `docker build -t steam-notifier .`, then `docker run -d --restart unless-stopped --env-file prod.env steam-notifier`. The image sets `STOPSIGNAL SIGINT`, so `docker stop` shuts the bot down cleanly instead of waiting 10 seconds and killing it.
+1. Create a Discord application in the [Developer Portal](https://discord.com/developers/applications), get its bot token, and invite it to your test server with the `bot` and `applications.commands` scopes. No privileged intents are needed. Allow DMs from that server's members.
+2. Create a dedicated PostgreSQL database and apply `schema.sql` once. Never load `fixtures.sql` into production. On Supabase, **disable the unused Data API** before creating the tables: this bot connects with psycopg, and SQL-created tables can otherwise be exposed through API grants. See [Supabase's Data API security instructions](https://supabase.com/docs/guides/api/securing-your-api#disable-the-data-api).
+3. On Supabase, copy the **session pooler** settings from the Connect dialog, including its `postgres.<project-ref>` username and `postgres` database name. The direct host can be IPv6-only; the shared transaction pooler does not support prepared statements. Set `POSTGRES_SSLMODE=require`. See [connection options](https://supabase.com/docs/guides/database/connecting-to-postgres).
+4. Run **one bot process** against the database. Stop local development copies before starting the deployed copy; do not run the standalone poller alongside it. Use the configuration above:
+   - **Replit:** import the release commit, put the variables in Secrets, and publish as a **Reserved VM / Background worker** using the committed `.replit` build and run commands. Verify the published app's secrets, including SSL and USD settings. See [Replit deployment types](https://docs.replit.com/features/publishing/deployment-types).
+   - **Any Docker host**, such as a small GCE VM: build a versioned image with `docker build -t steam-notifier:<release> .`, then start it with `docker run -d --name steam-notifier --restart unless-stopped --stop-timeout 60 --env-file prod.env steam-notifier:<release>`. Replace `<release>` with the Git commit ID. Keep `prod.env` private on the host; it is excluded from Git and the Docker build context. The image uses `STOPSIGNAL SIGINT` for shutdown; the 60-second grace period lets an in-flight request or database transaction finish.
 
 At startup the bot checks that the database is reachable and the required tables exist, and exits non-zero if either check fails. It does not validate every column or constraint. Logs go to stderr with timestamps.
+
+Before release, run the full suite with `REQUIRE_DB=1` against local PostgreSQL so skipped database tests cannot pass the release check. Then use a test bot and test database for a real Discord smoke test:
+
+- Confirm startup preflight, command sync and Steam price reads in the logs. Try `/watch 620`, the duplicate watch, `/list`, and `/unwatch 620`; replies should be private.
+- To verify delivery without waiting for a sale, watch `620` without a threshold, wait for its baseline, and stop the bot. In the **test database only**, raise `last_alerted_cents` on just your own `(discord_user_id, appid)` watch above the current price, then restart. Confirm one DM, no repeat on the next cycle, and that your watch survives restart.
+
+After publishing, repeat the command checks and confirm at least two poll cycles run while the local bot is stopped. Keep the last working release/image and a database backup. To roll back, stop the new process and start the previous release with the same secrets and database; do not reapply the schema or fixtures. The committed Compose file is for local development and loads fixtures on a fresh volume, so it is not the production database setup.
 
 ## Known limitations
 

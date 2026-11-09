@@ -18,6 +18,7 @@ services:
   bot:
     build: .
     profiles: ["bot"]
+    stop_grace_period: 60s
     env_file: .env
     environment:
       POSTGRES_HOST: db
