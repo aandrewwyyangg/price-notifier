@@ -27,7 +27,8 @@ SECOND_ALERT = UserAlert(
 
 
 @pytest.fixture(autouse=True)
-def no_rate_limit_sleep():
+def no_rate_limit_sleep(monkeypatch):
+    monkeypatch.setattr(poller, "_resume_appid", None)
     with patch.object(poller.time, "sleep"):
         yield
 
@@ -184,6 +185,54 @@ def test_a_stopped_poller_does_not_query_the_database():
     with patch.object(poller, "get_watched_appids") as get_watched_appids:
         assert poller.run_poll_cycle(stopped) == []
     get_watched_appids.assert_not_called()
+
+
+def test_rate_limit_resume_gets_past_unpriced_games_at_the_front():
+    # Neither an absent price nor a failed fetch moves last_checked_at.
+    # Re-reading the same SQL order must not starve games after that prefix.
+    appids = [FIRST_APPID, SECOND_APPID, THIRD_APPID]
+    attempts = 0
+
+    def steam_with_one_request_per_cycle(appid):
+        nonlocal attempts
+        attempts += 1
+        if attempts > 1:
+            raise poller.SteamRateLimited()
+        return SECOND_GAME if appid == THIRD_APPID else None
+
+    alerts = []
+    with patch.object(poller, "get_watched_appids", return_value=appids):
+        with patch.object(
+            poller,
+            "get_game",
+            side_effect=steam_with_one_request_per_cycle,
+        ) as get_game:
+            with patch.object(
+                poller, "process_price_observation", return_value=[SECOND_ALERT]
+            ) as process:
+                for _ in range(3):
+                    attempts = 0
+                    alerts.extend(poller.run_poll_cycle())
+
+    assert alerts == [SECOND_ALERT]
+    assert processed_appids(process) == [THIRD_APPID]
+    assert [call.args[0] for call in get_game.call_args_list] == [
+        FIRST_APPID, SECOND_APPID, SECOND_APPID, THIRD_APPID, THIRD_APPID, FIRST_APPID,
+    ]
+
+
+def test_resume_uses_current_watch_list_and_resets_after_a_complete_cycle():
+    with patch.object(poller, "check_one", side_effect=poller.SteamRateLimited()):
+        poller.check_all([SECOND_APPID])
+
+    # The rate-limited watch was removed before the next cycle.
+    with patch.object(poller, "check_one", return_value=[]) as check_one:
+        assert poller.check_all([FIRST_APPID, THIRD_APPID]) == []
+        assert poller.check_all([FIRST_APPID, THIRD_APPID]) == []
+
+    assert [call.args[0] for call in check_one.call_args_list] == [
+        FIRST_APPID, THIRD_APPID, FIRST_APPID, THIRD_APPID,
+    ]
 
 
 def steam_response(payload, status=200):

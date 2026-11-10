@@ -25,6 +25,9 @@ STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"
 
 STEAM_COUNTRY_CODE = os.getenv("STEAM_COUNTRY_CODE", "us")
 STEAM_EXPECTED_CURRENCY = os.getenv("STEAM_EXPECTED_CURRENCY", "USD")
+# There is one serial poller. Resume an interrupted cycle before retrying
+# unpriced games whose last successful fetch timestamp cannot advance.
+_resume_appid: int | None = None
 
 class SteamRateLimited(Exception):
     pass
@@ -117,6 +120,11 @@ def check_one(appid, stop_event: Event | None = None):
         return []
 
 def check_all(appids, stop_event: Event | None = None):
+    global _resume_appid
+    if _resume_appid in appids:
+        resume_at = appids.index(_resume_appid)
+        appids = appids[resume_at:] + appids[:resume_at]
+    _resume_appid = None
     collected_alerts = []
 
     for index, appid in enumerate(appids):
@@ -131,6 +139,7 @@ def check_all(appids, stop_event: Event | None = None):
         try:
             collected_alerts.extend(check_one(appid, stop_event))
         except SteamRateLimited:
+            _resume_appid = appid
             log_operation(
                 f"Steam rate limit hit at appid {appid}; ending this cycle "
                 f"early and leaving {len(appids) - index} game(s) for the next one"
