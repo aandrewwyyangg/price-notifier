@@ -16,7 +16,7 @@ The appid is the number in the store URL. Portal 2 is `620`. `/watch` looks the 
 
 One process runs both the Discord client and the price poller.
 
-1. Every 15 minutes the poller asks PostgreSQL which games anyone is watching, least recently checked first, then fetches each one from Steam's `appdetails` API, one request per second.
+1. Every 15 minutes the poller asks PostgreSQL which games anyone is watching, least recently checked first, then fetches each one from Steam's `appdetails` API, one request per second. After a rate limit, the next cycle resumes at the interrupted game and wraps around, so games with unreadable prices cannot hold up the rest indefinitely.
 2. Each price goes through one transaction: record the fetch, store the price if it changed, give brand-new watches a silent baseline, then move each watcher's ratchet and return who to notify, in a single `UPDATE ... RETURNING`.
 3. The transaction commits, then the bot sends the DMs.
 
@@ -114,4 +114,4 @@ After publishing, repeat the command checks and confirm at least two poll cycles
 - A user with DMs closed keeps a watch that can never reach them, and its ratchet keeps moving.
 - Free-to-play and unreleased games have no price, so their watches stay silent until Steam lists one.
 - Every database call opens its own connection; `psycopg_pool` would be the next step.
-- A cycle costs about a second per watched game, and Steam's undocumented rate limit (commonly reported as about 200 requests per five minutes) ends a cycle early. Games rotate, least recently checked first, so none is skipped forever, but past a couple of hundred games each one is checked less often. Going bigger would need backoff and one request budget shared with `/watch`'s lookups.
+- A cycle costs about a second per watched game, and Steam's undocumented rate limit can end a cycle early. Interrupted cycles resume on the next poll; the resume position is in memory and resets on restart. Larger watch lists mean each game is checked less often. Going bigger would need backoff and one request budget shared with `/watch`'s lookups.
