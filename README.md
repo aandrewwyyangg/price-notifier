@@ -10,7 +10,7 @@ A Discord bot that watches Steam game prices and sends you a DM when one drops.
 | `/unwatch <appid>` | Stop watching a game. |
 | `/list` | Show the games you're watching. |
 
-The appid is the number in the store URL. Portal 2 is `620`. `/watch` looks the appid up on Steam before saving it, so a typo gets an answer instead of a watch that never fires. Replies are visible only to you, and each user can watch up to 25 games.
+The appid is the number in the store URL. Portal 2 is `620`. `/watch` validates its format and saves directly to PostgreSQL, so adding a watch works while Steam is unavailable. The poller looks up the name and price later; a nonexistent appid stays silent until you `/unwatch` it. Replies are visible only to you, and each user can watch up to 25 games.
 
 ## How it works
 
@@ -28,10 +28,12 @@ psycopg and requests are blocking, so the poll cycle and command database calls 
 
 Every transaction sets a 10-second `statement_timeout`, so a stuck lock fails one call instead of freezing the poll loop. `/watch` takes a per-user advisory lock (`pg_advisory_xact_lock`) before checking the limit, so several commands sent at once can't take a user past it.
 
+Unusable prices, including values outside PostgreSQL's integer range, write nothing. Steam request failures and runtime `psycopg.OperationalError` are logged and retried on later polls; HTTP 429 ends the current cycle. Unexpected programming, schema, or configuration errors stop polling: the bot attempts any alerts already collected, closes Discord, and exits nonzero. Standalone polling emits its collected alerts before failing in the same way.
+
 | File | Role |
 | --- | --- |
 | `bot.py` | Discord client: slash commands, the poll loop, DM delivery, startup checks. |
-| `steampricingproject.py` | The poller: fetches prices, skips a game that fails, stops early if Steam rate-limits. |
+| `steampricingproject.py` | The poller: fetches prices, handles expected read failures and rate limits, propagates unexpected failures with collected alerts. |
 | `database.py` | Every connection and transaction. |
 | `queries.py` | The SQL. |
 | `output.py` | Message formatting and logging. |
@@ -101,6 +103,8 @@ The bot keeps a persistent outbound connection to Discord and serves no HTTP, so
 
 At startup the bot checks that the database is reachable and the required tables exist, and exits non-zero if either check fails. It does not validate every column or constraint. Logs go to stderr with timestamps.
 
+A fatal exit does not guarantee that the deployment stays stopped: Docker's `unless-stopped` policy can restart a failed process. Repeated fatal failures require correcting the cause or rolling back the release, rather than relying on restarts to repair it. See [Docker restart policies](https://docs.docker.com/engine/containers/start-containers-automatically/).
+
 Before release, run the full suite with `REQUIRE_DB=1` against local PostgreSQL so skipped database tests cannot pass the release check. Then use a test bot and test database for a real Discord smoke test:
 
 - Confirm startup preflight, command sync and Steam price reads in the logs. Try `/watch 620`, the duplicate watch, `/list`, and `/unwatch 620`; replies should be private.
@@ -114,4 +118,5 @@ After publishing, repeat the command checks and confirm at least two poll cycles
 - A user with DMs closed keeps a watch that can never reach them, and its ratchet keeps moving.
 - Free-to-play and unreleased games have no price, so their watches stay silent until Steam lists one.
 - Every database call opens its own connection; `psycopg_pool` would be the next step.
-- A cycle costs about a second per watched game, and Steam's undocumented rate limit can end a cycle early. Interrupted cycles resume on the next poll; the resume position is in memory and resets on restart. Larger watch lists mean each game is checked less often. Going bigger would need backoff and one request budget shared with `/watch`'s lookups.
+- A database password rotated while running still raises runtime `OperationalError` and follows the existing recovery policy. Startup preflight catches incorrect credentials on restart; runtime failures remain visible in logs.
+- A cycle costs about a second per watched game, and Steam's undocumented rate limit can end a cycle early. Interrupted cycles resume on the next poll; the resume position is in memory and resets on restart. Larger watch lists mean each game is checked less often. Going bigger would need backoff and a shared request budget.

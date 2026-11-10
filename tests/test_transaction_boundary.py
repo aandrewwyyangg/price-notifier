@@ -8,7 +8,8 @@ import database
 
 
 @pytest.mark.parametrize("commit_fails", [False, True], ids=["commit", "commit failure"])
-def test_alerts_are_built_only_after_the_transaction_exits(monkeypatch, commit_fails):
+@pytest.mark.parametrize("price", [499, database.PG_INTEGER_MAX])
+def test_alerts_are_built_only_after_the_transaction_exits(monkeypatch, commit_fails, price):
     # The SQL tests use SAVEPOINTs; this separately checks the production
     # connection boundary, including an error raised while committing.
     transaction_exited = False
@@ -43,9 +44,9 @@ def test_alerts_are_built_only_after_the_transaction_exits(monkeypatch, commit_f
 
     if commit_fails:
         with pytest.raises(psycopg.OperationalError, match="commit failed"):
-            database.process_price_observation(620, "Portal 2", 499)
+            database.process_price_observation(620, "Portal 2", price)
         builder.assert_not_called()
     else:
-        alerts = database.process_price_observation(620, "Portal 2", 499)
+        alerts = database.process_price_observation(620, "Portal 2", price)
         assert len(alerts) == 1
         builder.assert_called_once()

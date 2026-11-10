@@ -8,7 +8,6 @@ import aiohttp
 import discord
 import psycopg
 import pytest
-import requests
 from discord import app_commands
 
 import bot
@@ -21,10 +20,19 @@ STEAM_PORTAL_2 = {"name": "Portal 2", "price": 999}
 
 
 @pytest.fixture(autouse=True)
-def steam_lookup():
-    """/watch looks the appid up on Steam; no test may reach the real API."""
-    with patch.object(bot, "get_game", return_value=STEAM_PORTAL_2) as get_game:
-        yield get_game
+def no_steam_requests():
+    """Commands must stay available independently of Steam."""
+    with patch.object(
+        poller.requests, "get", side_effect=AssertionError("unexpected Steam request")
+    ) as request:
+        yield request
+        request.assert_not_called()
+
+
+@pytest.fixture(autouse=True)
+def isolated_poll_state(monkeypatch):
+    monkeypatch.setattr(bot.client, "fatal_poll_error", None)
+    monkeypatch.setattr(bot.client, "poll_stop", Event())
 
 
 def make_interaction(user_id=ALICE):
@@ -76,7 +84,7 @@ def test_watch_defers_first_parses_dollars_and_confirms_the_threshold():
     interaction.response.defer.assert_awaited_once_with(ephemeral=True)
     create_watch.assert_called_once_with(ALICE, PORTAL_2, 999)
     reply = only_reply(interaction)
-    assert reply.startswith("Watching Portal 2.")
+    assert reply.startswith("Watching appid 620.")
     # The first price is a silent baseline, so a game already under the
     # threshold stays quiet until it drops again. The reply has to say so.
     assert "each new low below $9.99, counting from the first price I see" in reply
@@ -95,57 +103,14 @@ def test_watch_without_a_threshold_passes_none():
     assert "each new low, counting from the first price I see" in reply
 
 
-def test_watch_asks_steam_only_after_deferring(steam_lookup):
+def test_watch_accepts_a_valid_appid_without_looking_it_up():
     interaction = make_interaction()
-    steam_lookup.side_effect = deferred_then(interaction, "the Steam lookup", STEAM_PORTAL_2)
-
-    with patch.object(bot, "create_watch", return_value=WatchResult.CREATED):
-        asyncio.run(bot.watch.callback(interaction, PORTAL_2, None))
-
-    steam_lookup.assert_called_once_with(PORTAL_2)
-
-
-def test_watch_refuses_an_appid_steam_does_not_list(steam_lookup):
-    interaction = make_interaction()
-    steam_lookup.return_value = None
-
-    with patch.object(bot, "create_watch") as create_watch:
-        asyncio.run(bot.watch.callback(interaction, 999_999_999, "9.99"))
-
-    create_watch.assert_not_called()
-    assert "couldn't find appid 999999999" in only_reply(interaction)
-
-
-@pytest.mark.parametrize(
-    "error",
-    [
-        pytest.param(requests.ConnectionError("steam unreachable"), id="Steam unreachable"),
-        pytest.param(requests.HTTPError("503 Server Error"), id="Steam server error"),
-        pytest.param(bot.SteamRateLimited("HTTP 429"), id="Steam rate limit"),
-    ],
-)
-def test_watch_is_saved_unchecked_when_steam_cannot_answer(steam_lookup, error):
-    interaction = make_interaction()
-    steam_lookup.side_effect = error
 
     with patch.object(bot, "create_watch", return_value=WatchResult.CREATED) as create_watch:
-        with patch.object(bot, "log_operation") as log_operation:
-            asyncio.run(bot.watch.callback(interaction, PORTAL_2, None))
+        asyncio.run(bot.watch.callback(interaction, 999_999_999, "9.99"))
 
-    create_watch.assert_called_once_with(ALICE, PORTAL_2, None)
-    assert only_reply(interaction).startswith("Watching appid 620.")
-    log_operation.assert_called_once()
-    assert "unchecked" in log_operation.call_args.args[0]
-
-
-def test_watch_escapes_markdown_in_the_game_name(steam_lookup):
-    interaction = make_interaction()
-    steam_lookup.return_value = {"name": "*Hades*", "price": None}
-
-    with patch.object(bot, "create_watch", return_value=WatchResult.CREATED):
-        asyncio.run(bot.watch.callback(interaction, 1145360, None))
-
-    assert only_reply(interaction).startswith(r"Watching \*Hades\*.")
+    create_watch.assert_called_once_with(ALICE, 999_999_999, 999)
+    assert only_reply(interaction).startswith("Watching appid 999999999.")
 
 
 def test_watch_reports_a_duplicate():
@@ -182,14 +147,13 @@ def test_watch_reports_the_per_user_limit():
         pytest.param(PORTAL_2, "0", id="price zero"),
     ],
 )
-def test_watch_rejects_bad_input_without_writing(appid, alert_below, steam_lookup):
+def test_watch_rejects_bad_input_without_writing(appid, alert_below):
     interaction = make_interaction()
 
     with patch.object(bot, "create_watch") as create_watch:
         asyncio.run(bot.watch.callback(interaction, appid, alert_below))
 
     create_watch.assert_not_called()
-    steam_lookup.assert_not_called()
     only_reply(interaction)
 
 
@@ -365,14 +329,107 @@ def test_poll_delivers_every_alert_in_order():
     assert [call.args[0] for call in deliver_alert.await_args_list] == alerts
 
 
-def test_poll_survives_an_unexpected_cycle_error():
-    with patch.object(bot, "run_poll_cycle", side_effect=RuntimeError("schema drift")):
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("missing configuration"), psycopg.ProgrammingError("schema drift")],
+)
+def test_an_unexpected_cycle_error_closes_the_client(error):
+    with patch.object(bot, "run_poll_cycle", side_effect=error):
         with patch.object(bot, "deliver_alert", new=AsyncMock()) as deliver_alert:
             with patch.object(bot, "log_exception") as log_exception:
-                asyncio.run(bot.poll_prices.coro())
+                with patch.object(bot.client, "close", new=AsyncMock()) as close:
+                    asyncio.run(bot.poll_prices.coro())
 
     deliver_alert.assert_not_awaited()
-    log_exception.assert_called_once()
+    assert bot.client.fatal_poll_error is error
+    log_exception.assert_called_once_with("Poll cycle failed; shutting down", error)
+    close.assert_awaited_once_with()
+
+
+def test_a_fatal_cycle_attempts_collected_alerts_before_closing():
+    alerts = [
+        bot.UserAlert(discord_user_id=1, appid=PORTAL_2, message="first"),
+        bot.UserAlert(discord_user_id=2, appid=PORTAL_2, message="second"),
+    ]
+    error = poller.PollCycleError(570, alerts)
+    attempted = []
+
+    async def deliver(alert):
+        assert bot.client.fatal_poll_error is error
+        attempted.append(alert)
+
+    async def close_client():
+        assert attempted == alerts
+
+    with patch.object(bot, "run_poll_cycle", side_effect=error):
+        with patch.object(bot, "deliver_alert", side_effect=deliver) as deliver_alert:
+            with patch.object(bot, "log_exception"):
+                with patch.object(bot.client, "close", side_effect=close_client) as close:
+                    asyncio.run(bot.poll_prices.coro())
+
+    assert deliver_alert.await_count == 2
+    close.assert_awaited_once_with()
+
+
+def test_closed_dms_during_fatal_draining_do_not_block_other_alerts():
+    alerts = [
+        bot.UserAlert(discord_user_id=1, appid=PORTAL_2, message="first"),
+        bot.UserAlert(discord_user_id=2, appid=PORTAL_2, message="second"),
+    ]
+    error = poller.PollCycleError(570, alerts)
+    forbidden = discord.Forbidden(Mock(status=403, reason="Forbidden"), "DMs closed")
+    users = [
+        SimpleNamespace(send=AsyncMock(side_effect=forbidden)),
+        SimpleNamespace(send=AsyncMock()),
+    ]
+
+    with patch.object(bot, "run_poll_cycle", side_effect=error):
+        with patch.object(bot.client, "fetch_user", side_effect=users) as fetch:
+            with patch.object(bot.client, "close", new=AsyncMock()) as close:
+                with patch.object(bot, "log_exception"):
+                    asyncio.run(bot.poll_prices.coro())
+
+    assert [call.args[0] for call in fetch.await_args_list] == [1, 2]
+    users[0].send.assert_awaited_once_with("first")
+    users[1].send.assert_awaited_once_with("second")
+    assert bot.client.fatal_poll_error is error
+    close.assert_awaited_once_with()
+
+
+def test_a_fatal_poll_stops_its_own_loop_without_cancelling_cleanup():
+    error = RuntimeError("broken query")
+
+    async def run_loop():
+        with patch.object(bot.client, "wait_until_ready", new=AsyncMock()):
+            with patch.object(bot, "run_poll_cycle", side_effect=error) as run_cycle:
+                with patch.object(discord.Client, "close", new=AsyncMock()) as close:
+                    task = bot.poll_prices.start()
+                    await asyncio.wait_for(task, timeout=2)
+        assert not task.cancelled()
+        assert bot.client.poll_stop.is_set()
+        assert bot.client.fatal_poll_error is error
+        assert not bot.poll_prices.is_running()
+        run_cycle.assert_called_once()
+        close.assert_awaited_once_with()
+
+    with patch.object(bot, "log_exception"):
+        asyncio.run(run_loop())
+
+
+def test_main_propagates_the_recorded_poll_failure():
+    error = poller.PollCycleError(570, [])
+
+    def run_client(*args, **kwargs):
+        bot.client.fatal_poll_error = error
+
+    with patch.object(bot, "require_bot_token", return_value="test-only"):
+        with patch.object(bot, "preflight"):
+            with patch.object(bot.signal, "signal"):
+                with patch.object(bot.client, "run", side_effect=run_client):
+                    with pytest.raises(poller.PollCycleError) as failure:
+                        bot.main()
+
+    assert failure.value is error
 
 
 def test_cancelling_a_poll_stops_its_worker_before_writing_or_fetching_again():

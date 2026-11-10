@@ -116,22 +116,52 @@ def test_an_unusable_steam_response_writes_nothing_and_the_cycle_continues():
     assert alerts == []
 
 
-def test_an_unexpected_error_for_one_game_keeps_the_other_games_alerts():
+@pytest.mark.parametrize(
+    "error",
+    [
+        psycopg.ProgrammingError("broken query"),
+        psycopg.DataError("invalid stored data"),
+        psycopg.IntegrityError("broken constraint"),
+        RuntimeError("missing configuration"),
+    ],
+)
+def test_an_unexpected_error_preserves_prior_alerts_and_stops_the_cycle(error):
     # FIRST_ALERT's ratchet is already committed when the second game fails,
     # so dropping it would lose the DM for good.
     with patch.object(poller, "get_game", side_effect=[FIRST_GAME, SECOND_GAME, SECOND_GAME]):
         with patch.object(
             poller,
             "process_price_observation",
-            side_effect=[[FIRST_ALERT], psycopg.ProgrammingError("bug"), [SECOND_ALERT]],
+            side_effect=[[FIRST_ALERT], error, [SECOND_ALERT]],
         ) as process_price_observation:
-            with patch.object(poller, "log_exception") as log_exception:
-                alerts = poller.check_all([FIRST_APPID, THIRD_APPID, SECOND_APPID])
+            with pytest.raises(poller.PollCycleError) as failure:
+                poller.check_all([FIRST_APPID, THIRD_APPID, SECOND_APPID])
 
-    assert alerts == [FIRST_ALERT, SECOND_ALERT]
-    assert len(processed_appids(process_price_observation)) == 3
-    log_exception.assert_called_once()
-    assert str(THIRD_APPID) in log_exception.call_args.args[0]
+    assert failure.value.alerts == [FIRST_ALERT]
+    assert failure.value.__cause__ is error
+    assert processed_appids(process_price_observation) == [FIRST_APPID, THIRD_APPID]
+    assert str(THIRD_APPID) in str(failure.value)
+
+
+def test_a_poll_cycle_error_keeps_a_snapshot_of_collected_alerts():
+    alerts = [FIRST_ALERT]
+    error = poller.PollCycleError(FIRST_APPID, alerts)
+    alerts.clear()
+    assert error.alerts == [FIRST_ALERT]
+
+
+def test_standalone_polling_emits_collected_alerts_before_failing():
+    error = poller.PollCycleError(THIRD_APPID, [FIRST_ALERT])
+    with patch.object(poller, "run_poll_cycle", side_effect=error) as run_cycle:
+        with patch.object(poller, "emit_user_alert") as emit:
+            with patch.object(poller.time, "sleep") as sleep:
+                with pytest.raises(poller.PollCycleError) as failure:
+                    poller.main()
+
+    assert failure.value is error
+    emit.assert_called_once_with(FIRST_ALERT)
+    run_cycle.assert_called_once_with()
+    sleep.assert_not_called()
 
 
 def test_a_steam_rate_limit_ends_the_cycle_early():
@@ -335,7 +365,10 @@ def test_a_server_error_raises_a_request_exception():
             poller.get_game(FIRST_APPID)
 
 
-@pytest.mark.parametrize("unusable_price", [None, True, False, "999", 9.99, -1])
+@pytest.mark.parametrize(
+    "unusable_price",
+    [None, True, False, "999", 9.99, -1, database.PG_INTEGER_MAX + 1, 10**100],
+)
 def test_unusable_prices_are_rejected_before_any_connection(unusable_price):
     with patch.object(database, "_connect") as connect:
         with patch.object(database, "log_operation") as log_operation:

@@ -10,9 +10,9 @@ from database import (
     process_price_observation,
 )
 from output import (
+    UserAlert,
     configure_logging,
     emit_user_alert,
-    log_exception,
     log_game_label,
     log_operation,
 )
@@ -31,6 +31,12 @@ _resume_appid: int | None = None
 
 class SteamRateLimited(Exception):
     pass
+
+
+class PollCycleError(Exception):
+    def __init__(self, appid: int, alerts: list[UserAlert]) -> None:
+        super().__init__(f"Polling failed for appid {appid}")
+        self.alerts = list(alerts)
 
 def get_game(appid, cc=None):
     if cc is None:
@@ -145,10 +151,8 @@ def check_all(appids, stop_event: Event | None = None):
                 f"early and leaving {len(appids) - index} game(s) for the next one"
             )
             break
-        except Exception:
-            log_exception(
-                f"Unexpected error checking appid {appid}; skipped it this cycle"
-            )
+        except Exception as error:
+            raise PollCycleError(appid, collected_alerts) from error
 
     return collected_alerts
 
@@ -165,10 +169,20 @@ def run_poll_cycle(stop_event: Event | None = None):
 
     return check_all(appids, stop_event)
 
-if __name__ == "__main__":
+def main() -> None:
     configure_logging()
     while True:
-        for alert in run_poll_cycle():
+        try:
+            alerts = run_poll_cycle()
+        except PollCycleError as error:
+            for alert in error.alerts:
+                emit_user_alert(alert)
+            raise
+        for alert in alerts:
             emit_user_alert(alert)
 
         time.sleep(POLL_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()

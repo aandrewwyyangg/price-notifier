@@ -7,13 +7,13 @@ from threading import Event
 from typing import Optional
 import discord
 import psycopg
-import requests
 from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
 
 from database import (
     MAX_WATCHES_PER_USER,
+    PG_INTEGER_MAX,
     WatchResult,
     create_watch,
     delete_watch,
@@ -29,17 +29,14 @@ from output import (
     log_error,
     log_exception,
     log_operation,
-    user_game_label,
 )
 from steampricingproject import (
     POLL_INTERVAL_SECONDS,
-    SteamRateLimited,
-    get_game,
+    PollCycleError,
     run_poll_cycle,
 )
 
 load_dotenv()
-PG_INTEGER_MAX = 2147483647
 MAX_PRICE_TEXT_LENGTH = 20
 PRICE_PATTERN = re.compile(r"\$?(\d*)(?:\.(\d{1,2}))?", re.ASCII)
 DATABASE_UNAVAILABLE = "The database is unreachable right now, please try again shortly."
@@ -77,6 +74,7 @@ class SteamNotifierClient(discord.Client):
         )
         self.tree = app_commands.CommandTree(self)
         self.poll_stop = Event()
+        self.fatal_poll_error: Exception | None = None
 
     async def setup_hook(self) -> None:
         self.poll_stop.clear()
@@ -93,7 +91,10 @@ class SteamNotifierClient(discord.Client):
 
     async def close(self) -> None:
         self.poll_stop.set()
-        poll_prices.cancel()
+        if poll_prices.get_task() is asyncio.current_task():
+            poll_prices.stop()
+        else:
+            poll_prices.cancel()
         await super().close()
 
 client = SteamNotifierClient()
@@ -101,17 +102,29 @@ client = SteamNotifierClient()
 
 @tasks.loop(seconds=POLL_INTERVAL_SECONDS)
 async def poll_prices() -> None:
+    fatal_error = None
     try:
         alerts = await asyncio.to_thread(run_poll_cycle, client.poll_stop)
     except asyncio.CancelledError:
         # Cancelling to_thread does not stop its worker thread.
         client.poll_stop.set()
         raise
-    except Exception:
-        log_exception("Poll cycle failed; the next cycle will try again")
-        return
-    for alert in alerts:
-        await deliver_alert(alert)
+    except PollCycleError as error:
+        alerts = error.alerts
+        fatal_error = error
+    except Exception as error:
+        alerts = []
+        fatal_error = error
+
+    if fatal_error is not None:
+        client.fatal_poll_error = fatal_error
+        log_exception("Poll cycle failed; shutting down", fatal_error)
+    try:
+        for alert in alerts:
+            await deliver_alert(alert)
+    finally:
+        if fatal_error is not None:
+            await client.close()
 
 @poll_prices.before_loop
 async def before_poll_prices() -> None:
@@ -201,22 +214,6 @@ async def watch(
             await reply(interaction, "The alert price has to be more than $0.00.")
             return
 
-    name = None
-    try:
-        game = await asyncio.to_thread(get_game, appid)
-    except (requests.RequestException, SteamRateLimited) as error:
-        # Steam being down shouldn't block a watch; the poller checks it later.
-        log_operation(f"Could not check appid {appid} with Steam: {error}; saving it unchecked")
-    else:
-        if game is None:
-            await reply(
-                interaction,
-                f"I couldn't find appid {appid} on the Steam store. It's the number "
-                "in the store URL, e.g. 620 for Portal 2.",
-            )
-            return
-        name = game["name"]
-
     try:
         result = await asyncio.to_thread(
             create_watch,
@@ -251,7 +248,7 @@ async def watch(
     )
     await reply(
         interaction,
-        f"Watching {user_game_label(appid, name)}. I'll DM you each new low{threshold_text}, "
+        f"Watching appid {appid}. I'll DM you each new low{threshold_text}, "
         "counting from the first price I see. If Steam has no price for it "
         "(free to play or unreleased), you won't hear anything until it does.",
     )
@@ -321,6 +318,8 @@ def main() -> None:
     # VM hosts commonly send SIGTERM; use asyncio's SIGINT cleanup path.
     signal.signal(signal.SIGTERM, lambda *_: signal.raise_signal(signal.SIGINT))
     client.run(token, log_handler=None)
+    if client.fatal_poll_error is not None:
+        raise client.fatal_poll_error
 
 if __name__ == "__main__":
     main()

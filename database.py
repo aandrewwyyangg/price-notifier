@@ -30,6 +30,7 @@ from queries import (
 
 load_dotenv()
 
+PG_INTEGER_MAX = 2147483647
 MAX_WATCHES_PER_USER = int(os.getenv("MAX_WATCHES_PER_USER", "25"))
 REQUIRED_TABLES = ("games", "prices", "watches")
 STATEMENT_TIMEOUT = "10s"
@@ -193,6 +194,7 @@ def process_price_observation(
         isinstance(new_price, bool)
         or not isinstance(new_price, int)
         or new_price < 0
+        or new_price > PG_INTEGER_MAX
     ):
         log_operation(
             f"No usable price for {label}; database unchanged"
